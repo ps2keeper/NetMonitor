@@ -15,10 +15,18 @@ CLASH_API_URL = os.environ.get("CLASH_API_URL", "http://127.0.0.1:9097")
 CLASH_SECRET = os.environ.get("CLASH_SECRET", "123456")
 POLL_INTERVAL = float(os.environ.get("POLL_INTERVAL", "1.0"))  # 每秒轮询一次活跃连接
 WEB_PORT = int(os.environ.get("WEB_PORT", "8899"))
-DB_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "traffic_history.db")
+# 数据文件存放路径（默认 E:\tmp\traffic_history.db，支持环境变量 DB_FILE 自定义）
+DEFAULT_DATA_DIR = r"E:\tmp" if (os.path.exists(r"E:\tmp") or os.name == "nt") else os.path.dirname(os.path.abspath(__file__))
+DB_FILE = os.environ.get("DB_FILE", os.path.join(DEFAULT_DATA_DIR, "traffic_history.db"))
 
 # --- 数据库初始化 ---
 def init_db():
+    db_dir = os.path.dirname(os.path.abspath(DB_FILE))
+    if db_dir:
+        try:
+            os.makedirs(db_dir, exist_ok=True)
+        except Exception:
+            pass
     conn = sqlite3.connect(DB_FILE)
     c = conn.cursor()
     c.execute("""
@@ -67,6 +75,7 @@ class TrafficCollector(threading.Thread):
 
     def run(self):
         print(f"[*] 流量采集服务已启动，监听 Clash API: {CLASH_API_URL}")
+        print(f"[*] 数据存储文件: {DB_FILE}")
         last_poll_time = time.time()
         
         while True:
@@ -1221,7 +1230,15 @@ def main():
     print(f"=====================================================")
 
     socketserver.TCPServer.allow_reuse_address = True
-    server = socketserver.TCPServer(("127.0.0.1", WEB_PORT), WebHandler)
+    try:
+        server = socketserver.TCPServer(("127.0.0.1", WEB_PORT), WebHandler)
+    except OSError as e:
+        if getattr(e, 'winerror', None) == 10048 or "10048" in str(e):
+            print(f"\n[提示] 端口 {WEB_PORT} 已被占用，NetMonitor 可能已经在后台运行中。")
+            print(f"可以直接在浏览器访问：http://127.0.0.1:{WEB_PORT}")
+            return
+        raise e
+
     try:
         server.serve_forever()
     except KeyboardInterrupt:

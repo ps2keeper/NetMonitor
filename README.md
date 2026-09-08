@@ -81,12 +81,14 @@ NetMonitor 支持通过系统环境变量无缝覆盖默认配置，无需修改
 | `CLASH_SECRET` | Clash Verge 外部控制密钥 (Secret) | `123456` |
 | `WEB_PORT` | NetMonitor 本地 Web 监控页面端口 | `8899` |
 | `POLL_INTERVAL` | 活跃连接轮询间隔（秒） | `1.0` |
+| `DB_FILE` | 流量历史 SQLite 数据库存储文件路径 | `E:\tmp\traffic_history.db` |
 
 示例（PowerShell）：
 ```powershell
 $env:CLASH_API_URL="http://127.0.0.1:9090"
 $env:CLASH_SECRET="my_custom_secret"
 $env:WEB_PORT="8900"
+$env:DB_FILE="E:\tmp\traffic_history.db"
 python monitor.py
 ```
 
