@@ -534,10 +534,21 @@ HTML_TEMPLATE = """<!DOCTYPE html>
                 <span>实时网速 (瞬时吞吐)</span>
                 <span>⚡ 动态</span>
             </div>
-            <div class="value down" id="live-down">0 KB/s</div>
+            <div class="value" style="display: flex; align-items: baseline; justify-content: space-between; gap: 8px; font-size: 19px; flex-wrap: wrap;">
+                <div style="display: inline-flex; align-items: baseline; gap: 4px;">
+                    <span style="font-size: 12px; color: var(--success); font-weight: 600;">↓ 下载</span>
+                    <strong id="live-down" style="color: var(--success); font-size: 21px; font-weight: 700;">0.00 KB/s</strong>
+                </div>
+                <div style="display: inline-flex; align-items: baseline; gap: 4px;">
+                    <span style="font-size: 12px; color: var(--primary); font-weight: 600;">↑ 上传</span>
+                    <strong id="live-up" style="color: var(--primary); font-size: 21px; font-weight: 700;">0.00 KB/s</strong>
+                </div>
+            </div>
             <div class="sub">
-                <span>下行: <strong id="sub-live-down" style="color:var(--success);">0 KB/s</strong></span>
-                <span>上行: <strong id="sub-live-up" style="color:var(--primary);">0 KB/s</strong></span>
+                <span>总吞吐: <strong id="live-total-speed" style="color: var(--text-main); font-weight: 600;">0.00 KB/s</strong></span>
+                <span id="sub-live-down" style="display:none;">0.00 KB/s</span>
+                <span id="sub-live-up" style="display:none;">0.00 KB/s</span>
+                <span style="margin-left: auto; font-size: 11px; color: var(--text-sub);">秒级刷新</span>
             </div>
         </div>
 
@@ -706,16 +717,25 @@ HTML_TEMPLATE = """<!DOCTYPE html>
         let refreshTimer = null;
         let cachedDailySummary = [];
 
+        // 截取并保留 2 位小数
+        function truncate2(val) {
+            if (val === null || val === undefined || isNaN(val) || val <= 0) return "0.00";
+            return (Math.floor(Number(val) * 100 + 0.000001) / 100).toFixed(2);
+        }
+
         function formatBytes(bytes) {
-            if (bytes === null || bytes === undefined || isNaN(bytes)) return "0 B";
-            if (bytes < 1024) return bytes + " B";
-            if (bytes < 1024 * 1024) return (bytes / 1024).toFixed(1) + " KB";
-            if (bytes < 1024 * 1024 * 1024) return (bytes / (1024 * 1024)).toFixed(2) + " MB";
-            return (bytes / (1024 * 1024 * 1024)).toFixed(2) + " GB";
+            if (bytes === null || bytes === undefined || isNaN(bytes) || bytes <= 0) return "0.00 B";
+            if (bytes < 1024) return truncate2(bytes) + " B";
+            if (bytes < 1024 * 1024) return truncate2(bytes / 1024) + " KB";
+            if (bytes < 1024 * 1024 * 1024) return truncate2(bytes / (1024 * 1024)) + " MB";
+            return truncate2(bytes / (1024 * 1024 * 1024)) + " GB";
         }
 
         function formatSpeed(bps) {
-            return formatBytes(bps) + "/s";
+            if (bps === null || bps === undefined || isNaN(bps) || bps <= 0) return "0.00 KB/s";
+            if (bps < 1024 * 1024) return truncate2(bps / 1024) + " KB/s";
+            if (bps < 1024 * 1024 * 1024) return truncate2(bps / (1024 * 1024)) + " MB/s";
+            return truncate2(bps / (1024 * 1024 * 1024)) + " GB/s";
         }
 
         function toggleAutoRefresh() {
@@ -801,10 +821,25 @@ HTML_TEMPLATE = """<!DOCTYPE html>
             const rt = data.realtime || {};
             const ov = data.overview || {};
 
-            // 实时速率
-            document.getElementById('live-down').innerText = formatSpeed(rt.current_down_speed || 0);
-            document.getElementById('sub-live-down').innerText = formatSpeed(rt.current_down_speed || 0);
-            document.getElementById('sub-live-up').innerText = formatSpeed(rt.current_up_speed || 0);
+            // 实时速率（瞬时吞吐同时显示下载、上传，截取2位小数）
+            const downSpd = rt.current_down_speed || 0;
+            const upSpd = rt.current_up_speed || 0;
+            const totalSpd = downSpd + upSpd;
+
+            const elLiveDown = document.getElementById('live-down');
+            if (elLiveDown) elLiveDown.innerText = formatSpeed(downSpd);
+
+            const elLiveUp = document.getElementById('live-up');
+            if (elLiveUp) elLiveUp.innerText = formatSpeed(upSpd);
+
+            const elTotalSpeed = document.getElementById('live-total-speed');
+            if (elTotalSpeed) elTotalSpeed.innerText = formatSpeed(totalSpd);
+
+            const elSubDown = document.getElementById('sub-live-down');
+            if (elSubDown) elSubDown.innerText = formatSpeed(downSpd);
+
+            const elSubUp = document.getElementById('sub-live-up');
+            if (elSubUp) elSubUp.innerText = formatSpeed(upSpd);
 
             // 今日总计
             const td = ov.today || {};
