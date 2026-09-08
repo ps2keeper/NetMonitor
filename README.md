@@ -55,19 +55,30 @@
 - 确认外部控制端口为 `9097`（即 `127.0.0.1:9097`）
 - 确认密钥（Secret）为 `123456`（若为其他值，见下方自定义配置说明）
 
-### 3. 启动运行
+### 3. 启动与停止运行
 
-#### 方式 A：双击快捷批处理（推荐）
-直接双击运行根目录下的 [`start_monitor.bat`](start_monitor.bat)。它会自动拉起监控服务并在默认浏览器打开仪表盘。
+#### 方式 A：双击批处理快捷启动（推荐）
+直接双击运行根目录下的 [`start_monitor.bat`](start_monitor.bat)。它会自动拉起后台监控、**自动隐藏/关闭控制台命令行黑框**，并在默认浏览器打开仪表盘。
 
-#### 方式 B：终端命令行启动
+#### 方式 B：纯静默启动（完全无黑框闪烁）
+双击运行 [`start_monitor_silent.vbs`](start_monitor_silent.vbs)，无任何窗口闪烁，后台静默拉起并打开浏览器。
+
+#### 方式 C：终端命令行启动
 ```powershell
-git clone https://github.com/ps2keeper/NetMonitor.git
-cd NetMonitor
+# 后台静默启动（自动隐藏控制台黑框）
 python monitor.py
+
+# 调试模式（保持命令行窗口显示与实时日志）
+python monitor.py --show
+
+# 停止后台监控服务
+python monitor.py --stop
 ```
 
-启动成功后，浏览器访问：👉 **http://127.0.0.1:8899**
+#### 停止服务
+双击运行根目录下的 [`stop_monitor.bat`](stop_monitor.bat) 即可一键安全停止所有后台运行的 NetMonitor 进程。
+
+启动成功后，浏览器随时访问：👉 **http://127.0.0.1:8899**
 
 ---
 
@@ -82,6 +93,7 @@ NetMonitor 支持通过系统环境变量无缝覆盖默认配置，无需修改
 | `WEB_PORT` | NetMonitor 本地 Web 监控页面端口 | `8899` |
 | `POLL_INTERVAL` | 活跃连接轮询间隔（秒） | `1.0` |
 | `DB_FILE` | 流量历史 SQLite 数据库存储文件路径 | `E:\tmp\traffic_history.db` |
+| `HIDE_CONSOLE` | 是否在 Windows 下自动隐藏控制台黑框（1: 隐藏, 0: 显示） | `1` |
 
 示例（PowerShell）：
 ```powershell
@@ -115,11 +127,13 @@ python monitor.py
 
 ```text
 NetMonitor/
-├── .gitignore          # Git 忽略配置（自动排除大体积 SQLite 数据库及缓存）
-├── LICENSE             # 开源协议 (MIT License)
-├── README.md           # 项目使用说明文档
-├── monitor.py          # 核心后端监控服务、API 轮询与内嵌 Web 仪表盘
-└── start_monitor.bat   # Windows 一键启动脚本
+├── .gitignore               # Git 忽略配置（自动排除大体积 SQLite 数据库及缓存）
+├── LICENSE                  # 开源协议 (MIT License)
+├── README.md                # 项目使用说明文档
+├── monitor.py               # 核心后端监控服务、API 轮询与内嵌 Web 仪表盘
+├── start_monitor.bat        # Windows 启动脚本（自动隐藏命令行黑框）
+├── start_monitor_silent.vbs # Windows 纯静默无黑框启动器
+└── stop_monitor.bat         # Windows 一键停止后台监控脚本
 ```
 
 ---

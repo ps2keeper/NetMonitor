@@ -4,6 +4,7 @@ import json
 import os
 import socketserver
 import sqlite3
+import sys
 import threading
 import time
 import urllib.parse
@@ -1252,8 +1253,46 @@ class WebHandler(http.server.BaseHTTPRequestHandler):
     def log_message(self, format, *args):
         pass
 
+# --- 控制台窗口与后台进程管理 ---
+def hide_console_window():
+    """在 Windows 下自动隐藏控制台命令行黑框窗口"""
+    if os.name == 'nt' and '--show' not in sys.argv and os.environ.get("HIDE_CONSOLE", "1") == "1":
+        try:
+            import ctypes
+            hwnd = ctypes.windll.kernel32.GetConsoleWindow()
+            if hwnd:
+                ctypes.windll.user32.ShowWindow(hwnd, 0)  # 0 = SW_HIDE
+        except Exception:
+            pass
+
+def stop_existing_monitor():
+    """停止后台正在运行的 NetMonitor 进程"""
+    if os.name == 'nt':
+        try:
+            import subprocess
+            my_pid = os.getpid()
+            ps_cmd = (
+                f"Get-CimInstance Win32_Process | "
+                f"Where-Object {{ $_.Name -match '^python' -and $_.CommandLine -match 'monitor\\.py' -and $_.CommandLine -notmatch '--stop' -and $_.ProcessId -ne {my_pid} }} | "
+                f"ForEach-Object {{ Stop-Process -Id $_.ProcessId -Force; Write-Host ('已成功停止 NetMonitor 后台进程 (PID: ' + $_.ProcessId + ')') }}"
+            )
+            res = subprocess.run(
+                ["powershell", "-NoProfile", "-Command", ps_cmd],
+                capture_output=True, text=True
+            )
+            out = res.stdout.strip()
+            if out:
+                print(out)
+            else:
+                print("未发现正在运行的 NetMonitor 后台进程。")
+        except Exception as e:
+            print(f"停止进程失败: {e}")
+
 def main():
     global collector
+    # Windows 下自动隐藏控制台命令行窗口（如需显示可传入 --show 参数）
+    hide_console_window()
+
     init_db()
     collector = TrafficCollector()
     collector.start()
@@ -1281,4 +1320,7 @@ def main():
         server.server_close()
 
 if __name__ == "__main__":
+    if "--stop" in sys.argv:
+        stop_existing_monitor()
+        sys.exit(0)
     main()
