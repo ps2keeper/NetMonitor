@@ -78,6 +78,11 @@ python monitor.py --stop
 #### 停止服务
 双击运行根目录下的 [`stop_monitor.bat`](stop_monitor.bat) 即可一键安全停止所有后台运行的 NetMonitor 进程。
 
+#### 方式 D：开启 / 取消开机自动启动
+- **开启开机自启**：双击运行根目录下的 [`enable_autostart.bat`](enable_autostart.bat)，或在终端执行 `python monitor.py --autostart`。开机时将在后台完全静默启动（不弹黑框，不干扰弹出浏览器）。
+- **取消开机自启**：双击运行根目录下的 [`disable_autostart.bat`](disable_autostart.bat)，或在终端执行 `python monitor.py --no-autostart`。
+- **任务管理器管理**：也可在 Windows **任务管理器 -> 启动应用** 中随时启用或禁用 `NetMonitor`。
+
 启动成功后，浏览器随时访问：👉 **http://127.0.0.1:8899**
 
 ---
