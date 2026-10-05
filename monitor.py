@@ -2233,6 +2233,17 @@ def main():
     # Windows 下自动隐藏控制台命令行窗口（如需显示可传入 --show 参数）
     hide_console_window()
 
+    # Windows 下禁用 allow_reuse_address，确保单一实例独占端口 8899
+    socketserver.TCPServer.allow_reuse_address = (os.name != 'nt')
+    try:
+        server = socketserver.TCPServer(("127.0.0.1", WEB_PORT), WebHandler)
+    except OSError as e:
+        if getattr(e, 'winerror', None) == 10048 or "10048" in str(e):
+            print(f"\n[提示] 端口 {WEB_PORT} 已被占用，NetMonitor 已经在后台正常运行中。")
+            print(f"可以直接在浏览器访问：http://127.0.0.1:{WEB_PORT}")
+            return
+        raise e
+
     init_db()
     collector = TrafficCollector()
     collector.start()
@@ -2242,16 +2253,6 @@ def main():
     print(f"  Web 仪表盘访问地址: http://127.0.0.1:{WEB_PORT}")
     print(f"  已开启每日流量汇总、历史排行及共用总流量统计功能")
     print(f"=====================================================")
-
-    socketserver.TCPServer.allow_reuse_address = True
-    try:
-        server = socketserver.TCPServer(("127.0.0.1", WEB_PORT), WebHandler)
-    except OSError as e:
-        if getattr(e, 'winerror', None) == 10048 or "10048" in str(e):
-            print(f"\n[提示] 端口 {WEB_PORT} 已被占用，NetMonitor 可能已经在后台运行中。")
-            print(f"可以直接在浏览器访问：http://127.0.0.1:{WEB_PORT}")
-            return
-        raise e
 
     try:
         server.serve_forever()

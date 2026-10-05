@@ -1,10 +1,16 @@
-' NetMonitor 静默启动器（完全无控制台黑框）
+Option Explicit
+Dim ws, fso, currentDir
+
 Set ws = CreateObject("WScript.Shell")
 Set fso = CreateObject("Scripting.FileSystemObject")
 currentDir = fso.GetParentFolderName(WScript.ScriptFullName)
+ws.CurrentDirectory = currentDir
 
-' 打开 Web 仪表盘
+' 1. Start monitor in background (completely hidden without console window)
+ws.Run "cmd.exe /c pythonw """ & currentDir & "\monitor.py""", 0, False
+
+' 2. Wait briefly for server to bind port
+WScript.Sleep 500
+
+' 3. Open dashboard in default browser
 ws.Run "http://127.0.0.1:8899", 1
-
-' 启动后台监控程序（窗口参数 0 表示完全隐藏无黑框）
-ws.Run "pythonw """ & currentDir & "\monitor.py""", 0
