@@ -83,6 +83,9 @@ python monitor.py --stop
 - **取消开机自启**：双击运行根目录下的 [`disable_autostart.bat`](disable_autostart.bat)，或在终端执行 `python monitor.py --no-autostart`。
 - **任务管理器管理**：也可在 Windows **任务管理器 -> 启动应用** 中随时启用或禁用 `NetMonitor`。
 
+#### 方式 E：一键创建桌面快捷方式
+- 双击运行根目录下的 [`create_desktop_shortcut.bat`](create_desktop_shortcut.bat)，即可在桌面生成配备专属图标的 `NetMonitor.lnk` 快捷方式（双击后自动静默拉起监控服务并在默认浏览器打开仪表盘）。
+
 启动成功后，浏览器随时访问：👉 **http://127.0.0.1:8899**
 
 ---

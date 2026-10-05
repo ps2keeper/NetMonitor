@@ -478,6 +478,8 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
         .kpi-icon-green { background: rgba(52, 211, 153, 0.1); color: var(--down); }
         .kpi-icon-purple { background: rgba(168, 85, 247, 0.1); color: #c084fc; }
         .kpi-icon-amber { background: rgba(251, 191, 36, 0.1); color: var(--warn); }
+        .kpi-icon-teal { background: rgba(45, 212, 191, 0.1); color: #2dd4bf; }
+
 
         .kpi-value {
             font-size: 26px;
@@ -1143,7 +1145,35 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
             </div>
         </div>
 
-        <!-- 卡片 4：历史累计流量 -->
+        <!-- 卡片 4：上月累计流量 -->
+        <div class="kpi-card">
+            <div class="kpi-header">
+                <span class="kpi-title">上月累计总流量 (<span id="last-month-label-str">上月</span>)</span>
+                <div class="kpi-icon-wrap kpi-icon-teal">
+                    <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                        <rect x="3" y="4" width="18" height="18" rx="2" ry="2"></rect>
+                        <line x1="16" y1="2" x2="16" y2="6"></line>
+                        <line x1="8" y1="2" x2="8" y2="6"></line>
+                        <line x1="3" y1="10" x2="21" y2="10"></line>
+                        <polyline points="9 11 8 13 10 13 9 15"></polyline>
+                    </svg>
+                </div>
+            </div>
+            <div class="kpi-value" id="last-month-total-str">
+                0.00 <span class="unit">GB</span>
+            </div>
+            <div class="kpi-sub">
+                <span class="chip chip-down">
+                    下行 <strong id="last-month-dl-str" class="tabular">0 GB</strong>
+                </span>
+                <span class="chip chip-up">
+                    上行 <strong id="last-month-ul-str" class="tabular">0 GB</strong>
+                </span>
+                <span class="chip chip-muted" id="last-month-days-count" style="margin-left:auto;">0 天</span>
+            </div>
+        </div>
+
+        <!-- 卡片 5：历史累计流量 -->
         <div class="kpi-card">
             <div class="kpi-header">
                 <span class="kpi-title">历史监控累计总流量</span>
@@ -1192,8 +1222,12 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
                     <span style="display:inline-block; width:8px; height:8px; background:var(--up); border-radius:2px;"></span>
                     上行上传
                 </span>
+                <select class="filter-select" id="daily-month-select" onchange="onDailyMonthChanged(this.value)" style="font-size:12px; padding:4px 10px;">
+                    <!-- 动态生成 -->
+                </select>
             </div>
         </div>
+
 
         <!-- 柱状图可视化与左右箭头导航 -->
         <div class="chart-carousel-wrap">
@@ -1355,6 +1389,7 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
         let autoRefresh = true;
         let refreshTimer = null;
         let cachedDailySummary = [];
+        let currentDailyMonth = '';   // 每日汇总月份筛选，空串=全部，默认初始化为当月
 
         // 精确截取保留 2 位小数
         function truncate2(val) {
@@ -1588,6 +1623,14 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
             document.getElementById('yesterday-dl-str').innerText = formatBytes(yd.download || 0);
             document.getElementById('yesterday-ul-str').innerText = formatBytes(yd.upload || 0);
 
+            // 上月累计
+            const lm = ov.last_month || {};
+            document.getElementById('last-month-label-str').innerText = lm.label || '上月';
+            document.getElementById('last-month-total-str').innerHTML = formatKpiHtml(lm.total || 0);
+            document.getElementById('last-month-dl-str').innerText = formatBytes(lm.download || 0);
+            document.getElementById('last-month-ul-str').innerText = formatBytes(lm.upload || 0);
+            document.getElementById('last-month-days-count').innerText = `${lm.days_count || 0} 天`;
+
             // 历史累计
             const at = ov.all_time || {};
             document.getElementById('all-total-str').innerHTML = formatKpiHtml(at.total || 0);
@@ -1596,15 +1639,15 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
             document.getElementById('all-days-count').innerText = `${at.days_count || 0} 天记录`;
         }
 
+
         // 渲染每日汇总与柱状图
         function renderDailySection(data) {
             const list = data.daily_summary || [];
             cachedDailySummary = list;
 
-            // 下拉选择项同步
+            // 下拉选择项同步（各程序排名区域）
             const dateSelect = document.getElementById('date-select');
             const datesInDb = data.available_dates || [];
-            
             let optionsHtml = `
                 <option value="today">今天 (${data.overview?.today?.date || ''})</option>
                 <option value="yesterday">昨天 (${data.overview?.yesterday?.date || ''})</option>
@@ -1618,14 +1661,37 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
 
             updateQuickButtons();
 
+            // 月份选择器初始化
+            const months = data.available_months || [];
+            const monthSelect = document.getElementById('daily-month-select');
+            if (monthSelect) {
+                // 首次加载时默认设为当月
+                if (!currentDailyMonth && months.length > 0) {
+                    const now = new Date();
+                    const thisMonth = `${now.getFullYear()}-${String(now.getMonth()+1).padStart(2,'0')}`;
+                    currentDailyMonth = months.includes(thisMonth) ? thisMonth : months[0];
+                }
+                let mHtml = '';
+                months.forEach(m => {
+                    const [y, mo] = m.split('-');
+                    mHtml += `<option value="${m}" ${m === currentDailyMonth ? 'selected' : ''}>${y}年${mo}月</option>`;
+                });
+                monthSelect.innerHTML = mHtml;
+            }
+
+            // 按月过滤
+            const filtered = currentDailyMonth
+                ? list.filter(item => item.date.startsWith(currentDailyMonth))
+                : list;
+
             // 柱状图
             const chartBox = document.getElementById('daily-chart');
-            if (list.length === 0) {
-                chartBox.innerHTML = '<div style="margin:auto; color:var(--text-muted); font-size:12px;">暂无历史日度记录</div>';
+            if (filtered.length === 0) {
+                chartBox.innerHTML = '<div style="margin:auto; color:var(--text-muted); font-size:12px;">该月暂无历史日度记录</div>';
                 updateChartArrows();
             } else {
-                const maxDayTotal = Math.max(...list.map(d => d.total), 1);
-                const sortedForChart = [...list].reverse();
+                const maxDayTotal = Math.max(...filtered.map(d => d.total), 1);
+                const sortedForChart = [...filtered].reverse();
                 chartBox.innerHTML = sortedForChart.map(item => {
                     const isSelected = (item.date === data.selected_date);
                     const dlHeight = Math.max(Math.round((item.download / maxDayTotal) * 78), 3);
@@ -1656,12 +1722,12 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
 
             // 每日表格
             const tbody = document.getElementById('daily-table-body');
-            if (list.length === 0) {
-                tbody.innerHTML = '<tr><td colspan="7" class="text-center" style="padding: 24px; color: var(--text-muted);">暂无每日汇总数据</td></tr>';
+            if (filtered.length === 0) {
+                tbody.innerHTML = '<tr><td colspan="7" class="text-center" style="padding: 24px; color: var(--text-muted);">该月暂无每日汇总数据</td></tr>';
                 return;
             }
 
-            tbody.innerHTML = list.map(item => {
+            tbody.innerHTML = filtered.map(item => {
                 const isSelected = (item.date === data.selected_date);
                 return `
                     <tr class="${isSelected ? 'selected-row' : ''}">
@@ -1687,6 +1753,15 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
                 `;
             }).join('');
         }
+
+        // 月份切换处理
+        function onDailyMonthChanged(val) {
+            currentDailyMonth = val;
+            window._chartInitialized = false;  // 切换月份时重新滚动到最新
+            fetchData(false);
+        }
+
+
 
         // 渲染排行榜表格
         function renderRankingSection(data) {
@@ -1894,14 +1969,31 @@ class WebHandler(http.server.BaseHTTPRequestHandler):
             """, (yesterday_str,))
             y_dl, y_ul = c.fetchone()
 
-            # 3. 查询历史总计
+            # 3. 查询上月数据
+            first_day_this_month = datetime.now().replace(day=1)
+            last_month_date = first_day_this_month - timedelta(days=1)
+            last_month_str = last_month_date.strftime("%Y-%m")
+            last_month_label = last_month_date.strftime("%Y年%m月")
+            c.execute("""
+                SELECT COALESCE(SUM(download_bytes), 0), COALESCE(SUM(upload_bytes), 0), COUNT(DISTINCT date_str)
+                FROM process_traffic WHERE substr(date_str, 1, 7) = ?
+            """, (last_month_str,))
+            lm_dl, lm_ul, lm_days = c.fetchone()
+
+            # 4. 获取所有可用月份列表
+            c.execute("""
+                SELECT DISTINCT substr(date_str, 1, 7) as m FROM process_traffic ORDER BY m DESC
+            """)
+            available_months = [row[0] for row in c.fetchall()]
+
+            # 5. 查询历史总计
             c.execute("""
                 SELECT COALESCE(SUM(download_bytes), 0), COALESCE(SUM(upload_bytes), 0), COUNT(DISTINCT date_str)
                 FROM process_traffic
             """)
             a_dl, a_ul, days_cnt = c.fetchone()
 
-            # 4. 每日汇总列表
+            # 6. 每日汇总列表
             c.execute("""
                 SELECT date_str,
                        COALESCE(SUM(download_bytes), 0) as dl,
@@ -2016,6 +2108,14 @@ class WebHandler(http.server.BaseHTTPRequestHandler):
                         "upload": y_ul,
                         "total": y_dl + y_ul
                     },
+                    "last_month": {
+                        "month": last_month_str,
+                        "label": last_month_label,
+                        "download": lm_dl,
+                        "upload": lm_ul,
+                        "total": lm_dl + lm_ul,
+                        "days_count": lm_days
+                    },
                     "all_time": {
                         "download": a_dl,
                         "upload": a_ul,
@@ -2025,10 +2125,12 @@ class WebHandler(http.server.BaseHTTPRequestHandler):
                 },
                 "daily_summary": daily_summary,
                 "available_dates": available_dates,
+                "available_months": available_months,
                 "selected_date": actual_date,
                 "selected_date_total": selected_date_total,
                 "ranking": ranking
             }
+
 
             self.send_response(200)
             self.send_header("Content-Type", "application/json; charset=utf-8")
