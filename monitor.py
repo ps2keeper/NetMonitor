@@ -1060,6 +1060,14 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
                 </svg>
                 <span>立即刷新</span>
             </button>
+            <button class="btn-ghost" onclick="launchMiniWidget()" title="在桌面最前端唤起极简 Mini 悬浮窗">
+                <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                    <rect x="2" y="3" width="20" height="14" rx="2" ry="2"></rect>
+                    <line x1="8" y1="21" x2="16" y2="21"></line>
+                    <line x1="12" y1="17" x2="12" y2="21"></line>
+                </svg>
+                <span>🖥️ 桌面悬浮窗</span>
+            </button>
         </div>
     </header>
 
@@ -1901,6 +1909,16 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
             }).join('');
         }
 
+        // 唤起桌面 Mini 悬浮窗
+        function launchMiniWidget() {
+            fetch('/api/mini/launch')
+                .then(r => r.json())
+                .then(d => {
+                    console.log('Mini widget launched');
+                })
+                .catch(e => console.error(e));
+        }
+
         // 首次加载与定时器
         fetchData(true);
         setInterval(() => fetchData(false), 2000);
@@ -1910,6 +1928,29 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
 </html>"""
 
 collector = None
+
+# --- 历史统计查询缓存（大幅降低高频轮询的数据库 CPU 开销）---
+_stats_cache = {
+    "timestamp": 0,
+    "overview": None,
+    "daily_summary": None,
+    "available_dates": None,
+    "available_months": None,
+    "ranking": None,
+    "selected_date_total": 0
+}
+_stats_cache_lock = threading.Lock()
+
+_mini_cache = {
+    "timestamp": 0,
+    "overview": None,
+    "ranking": None
+}
+_mini_cache_lock = threading.Lock()
+
+class ThreadedTCPServer(socketserver.ThreadingMixIn, socketserver.TCPServer):
+    daemon_threads = True
+    allow_reuse_address = (os.name != 'nt')
 
 class WebHandler(http.server.BaseHTTPRequestHandler):
     def do_GET(self):
@@ -1928,6 +1969,124 @@ class WebHandler(http.server.BaseHTTPRequestHandler):
             self.end_headers()
             self.wfile.write(FAVICON_SVG.encode("utf-8"))
             return
+
+        if parsed.path == "/api/mini/launch":
+            base_dir = os.path.dirname(os.path.abspath(__file__))
+            mini_script = os.path.join(base_dir, "mini_widget.py")
+            if os.path.exists(mini_script):
+                try:
+                    import subprocess
+                    python_exe = sys.executable
+                    pythonw_cand = os.path.join(os.path.dirname(python_exe), "pythonw.exe")
+                    target_exe = pythonw_cand if os.path.exists(pythonw_cand) else python_exe
+                    flags = 0x08000000 if os.name == 'nt' else 0
+                    subprocess.Popen([target_exe, mini_script], cwd=base_dir, creationflags=flags)
+                except Exception:
+                    pass
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json; charset=utf-8")
+            self.send_header("Access-Control-Allow-Origin", "*")
+            self.end_headers()
+            self.wfile.write(b'{"status":"ok"}')
+            return
+
+        if parsed.path == "/api/mini/stats":
+            with collector.lock:
+                rt = {
+                    "current_down_speed": collector.realtime_stats["current_down_speed"],
+                    "current_up_speed": collector.realtime_stats["current_up_speed"],
+                    "process_speeds": collector.realtime_stats["process_speeds"].copy()
+                }
+
+            today_str = datetime.now().strftime("%Y-%m-%d")
+            now_ts = time.time()
+
+            # 专用轻量内存缓存（2秒），绝大多数时间 0ms 纯内存即时返回
+            with _mini_cache_lock:
+                if (now_ts - _mini_cache["timestamp"] < 2.0) and (_mini_cache["overview"] is not None):
+                    payload = {
+                        "realtime": rt,
+                        "overview": _mini_cache["overview"],
+                        "ranking": _mini_cache["ranking"]
+                    }
+                    self.send_response(200)
+                    self.send_header("Content-Type", "application/json; charset=utf-8")
+                    self.send_header("Access-Control-Allow-Origin", "*")
+                    self.end_headers()
+                    self.wfile.write(json.dumps(payload).encode("utf-8"))
+                    return
+
+            try:
+                conn = sqlite3.connect(DB_FILE, timeout=3)
+                c = conn.cursor()
+                c.execute("""
+                    SELECT COALESCE(SUM(download_bytes), 0), COALESCE(SUM(upload_bytes), 0)
+                    FROM process_traffic WHERE date_str = ?
+                """, (today_str,))
+                t_dl, t_ul = c.fetchone()
+                today_tot = t_dl + t_ul
+
+                c.execute("""
+                    SELECT process_name, process_path,
+                           COALESCE(SUM(download_bytes), 0) as dl,
+                           COALESCE(SUM(upload_bytes), 0) as ul,
+                           COALESCE(SUM(download_bytes + upload_bytes), 0) as tot
+                    FROM process_traffic
+                    WHERE date_str = ?
+                    GROUP BY process_name
+                    ORDER BY tot DESC
+                    LIMIT 30
+                """, (today_str,))
+                ranking = []
+                for idx, (p_name, p_path, dl, ul, tot) in enumerate(c.fetchall(), 1):
+                    pct = round((tot / today_tot * 100), 2) if today_tot > 0 else 0
+                    ranking.append({
+                        "rank": idx,
+                        "process_name": p_name,
+                        "process_path": p_path,
+                        "download": dl,
+                        "upload": ul,
+                        "total": tot,
+                        "pct": pct
+                    })
+                conn.close()
+
+                overview_today = {
+                    "today": {
+                        "download": t_dl,
+                        "upload": t_ul,
+                        "total": today_tot
+                    }
+                }
+
+                with _mini_cache_lock:
+                    _mini_cache["timestamp"] = now_ts
+                    _mini_cache["overview"] = overview_today
+                    _mini_cache["ranking"] = ranking
+
+                payload = {
+                    "realtime": rt,
+                    "overview": overview_today,
+                    "ranking": ranking
+                }
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json; charset=utf-8")
+                self.send_header("Access-Control-Allow-Origin", "*")
+                self.end_headers()
+                self.wfile.write(json.dumps(payload).encode("utf-8"))
+                return
+            except Exception:
+                fallback = {
+                    "realtime": rt,
+                    "overview": {"today": {"download": 0, "upload": 0, "total": 0}},
+                    "ranking": []
+                }
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json; charset=utf-8")
+                self.send_header("Access-Control-Allow-Origin", "*")
+                self.end_headers()
+                self.wfile.write(json.dumps(fallback).encode("utf-8"))
+                return
 
         if parsed.path == "/api/stats":
             qs = urllib.parse.parse_qs(parsed.query)
@@ -1951,6 +2110,29 @@ class WebHandler(http.server.BaseHTTPRequestHandler):
                 actual_date = today_str
             elif date_filter == "yesterday":
                 actual_date = yesterday_str
+
+            # 命中内存缓存（5秒有效期），秒级响应且零数据库开销
+            use_cache = (actual_date == today_str and not search_kw and sort_by == "total")
+            now_ts = time.time()
+            if use_cache:
+                with _stats_cache_lock:
+                    if (now_ts - _stats_cache["timestamp"] < 5.0) and (_stats_cache["overview"] is not None):
+                        payload = {
+                            "realtime": rt,
+                            "overview": _stats_cache["overview"],
+                            "daily_summary": _stats_cache["daily_summary"],
+                            "available_dates": _stats_cache["available_dates"],
+                            "available_months": _stats_cache["available_months"],
+                            "selected_date": actual_date,
+                            "selected_date_total": _stats_cache["selected_date_total"],
+                            "ranking": _stats_cache["ranking"]
+                        }
+                        self.send_response(200)
+                        self.send_header("Content-Type", "application/json; charset=utf-8")
+                        self.send_header("Access-Control-Allow-Origin", "*")
+                        self.end_headers()
+                        self.wfile.write(json.dumps(payload).encode("utf-8"))
+                        return
 
             conn = sqlite3.connect(DB_FILE, timeout=5)
             c = conn.cursor()
@@ -1993,7 +2175,7 @@ class WebHandler(http.server.BaseHTTPRequestHandler):
             """)
             a_dl, a_ul, days_cnt = c.fetchone()
 
-            # 6. 每日汇总列表
+            # 6. 每日汇总列表 (限制最近 60 天，前 14 天计算 TOP 进程，避免全表扫描卡死)
             c.execute("""
                 SELECT date_str,
                        COALESCE(SUM(download_bytes), 0) as dl,
@@ -2003,22 +2185,25 @@ class WebHandler(http.server.BaseHTTPRequestHandler):
                 FROM process_traffic
                 GROUP BY date_str
                 ORDER BY date_str DESC
+                LIMIT 60
             """)
             daily_rows = c.fetchall()
             
             daily_summary = []
             available_dates = []
-            for d, dl, ul, tot, cnt in daily_rows:
+            for idx, (d, dl, ul, tot, cnt) in enumerate(daily_rows):
                 available_dates.append(d)
-                c.execute("""
-                    SELECT process_name, SUM(download_bytes + upload_bytes) as p_tot
-                    FROM process_traffic
-                    WHERE date_str = ?
-                    GROUP BY process_name
-                    ORDER BY p_tot DESC
-                    LIMIT 1
-                """, (d,))
-                top_p = c.fetchone()
+                top_p = None
+                if idx < 14:
+                    c.execute("""
+                        SELECT process_name, SUM(download_bytes + upload_bytes) as p_tot
+                        FROM process_traffic
+                        WHERE date_str = ?
+                        GROUP BY process_name
+                        ORDER BY p_tot DESC
+                        LIMIT 1
+                    """, (d,))
+                    top_p = c.fetchone()
                 daily_summary.append({
                     "date": d,
                     "download": dl,
@@ -2131,6 +2316,15 @@ class WebHandler(http.server.BaseHTTPRequestHandler):
                 "ranking": ranking
             }
 
+            if use_cache:
+                with _stats_cache_lock:
+                    _stats_cache["timestamp"] = now_ts
+                    _stats_cache["overview"] = payload["overview"]
+                    _stats_cache["daily_summary"] = daily_summary
+                    _stats_cache["available_dates"] = available_dates
+                    _stats_cache["available_months"] = available_months
+                    _stats_cache["selected_date_total"] = selected_date_total
+                    _stats_cache["ranking"] = ranking
 
             self.send_response(200)
             self.send_header("Content-Type", "application/json; charset=utf-8")
@@ -2164,14 +2358,14 @@ def stop_existing_monitor():
             my_pid = os.getpid()
             ps_cmd = (
                 f"Get-CimInstance Win32_Process | "
-                f"Where-Object {{ $_.Name -match '^python' -and $_.CommandLine -match 'monitor\\.py' -and $_.CommandLine -notmatch '--stop' -and $_.ProcessId -ne {my_pid} }} | "
+                f"Where-Object {{ $_.Name -match '^python' -and $_.CommandLine -match '(monitor|mini_widget)\\.py' -and $_.CommandLine -notmatch '--stop' -and $_.ProcessId -ne {my_pid} }} | "
                 f"ForEach-Object {{ Stop-Process -Id $_.ProcessId -Force; Write-Host ('已成功停止 NetMonitor 后台进程 (PID: ' + $_.ProcessId + ')') }}"
             )
             res = subprocess.run(
                 ["powershell", "-NoProfile", "-Command", ps_cmd],
-                capture_output=True, text=True
+                capture_output=True, encoding="utf-8", errors="replace"
             )
-            out = res.stdout.strip()
+            out = (res.stdout or "").strip()
             if out:
                 print(out)
             else:
@@ -2207,7 +2401,7 @@ def enable_autostart():
     )
     import subprocess
     try:
-        subprocess.run(["powershell", "-NoProfile", "-Command", ps_cmd], check=True, capture_output=True)
+        subprocess.run(["powershell", "-NoProfile", "-Command", ps_cmd], check=True, capture_output=True, encoding="utf-8", errors="replace")
         if os.path.exists(lnk_path):
             print(f"[OK] 已成功开启 NetMonitor 开机自动启动！")
             print(f"快捷方式位置: {lnk_path}")
@@ -2234,9 +2428,9 @@ def main():
     hide_console_window()
 
     # Windows 下禁用 allow_reuse_address，确保单一实例独占端口 8899
-    socketserver.TCPServer.allow_reuse_address = (os.name != 'nt')
+    ThreadedTCPServer.allow_reuse_address = (os.name != 'nt')
     try:
-        server = socketserver.TCPServer(("127.0.0.1", WEB_PORT), WebHandler)
+        server = ThreadedTCPServer(("127.0.0.1", WEB_PORT), WebHandler)
     except OSError as e:
         if getattr(e, 'winerror', None) == 10048 or "10048" in str(e):
             print(f"\n[提示] 端口 {WEB_PORT} 已被占用，NetMonitor 已经在后台正常运行中。")
@@ -2263,6 +2457,18 @@ def main():
 if __name__ == "__main__":
     if "--stop" in sys.argv:
         stop_existing_monitor()
+        sys.exit(0)
+    if "--mini" in sys.argv:
+        base_dir = os.path.dirname(os.path.abspath(__file__))
+        mini_script = os.path.join(base_dir, "mini_widget.py")
+        if os.path.exists(mini_script):
+            python_exe = sys.executable
+            pythonw_cand = os.path.join(os.path.dirname(python_exe), "pythonw.exe")
+            target_exe = pythonw_cand if os.path.exists(pythonw_cand) else python_exe
+            flags = 0x08000000 if os.name == 'nt' else 0
+            import subprocess
+            subprocess.Popen([target_exe, mini_script], cwd=base_dir, creationflags=flags)
+            print("[OK] NetMonitor 桌面悬浮窗已启动！")
         sys.exit(0)
     if "--autostart" in sys.argv:
         enable_autostart()

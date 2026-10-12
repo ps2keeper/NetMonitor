@@ -37,7 +37,13 @@
   UI 自动标记超大流量应用（> 1 GB 标红警示，> 300 MB 醒目标注）。
 - 🔍 **便捷检索与多维排序**：
   支持通过程序名称、文件路径关键词快速模糊过滤，支持按总流量、下载量、上传量自由排序。
-- 📊 **现代化暗色仪表盘 UI**：
+- 🖥️ **桌面极简置顶悬浮窗 & 原生 APP 详情面板（Mini Desktop Widget & APP）**：
+  - 独立的 Windows 原生桌面应用（纯 Python 原生 GUI，非网页），悬浮窗常驻桌面最前端（Always on Top）。
+  - **极简胶囊悬浮窗**：仅显示**当前下载速率 (`↓`)**、**当前上传速率 (`↑`)** 以及 **当日累计总流量 (`今日`)**。
+  - **原生 APP 详情面板**：双击悬浮窗即可即刻唤起**原生深色详情窗口**（展示当前各进程实时网速排行、今日各程序流量消耗 TOP 50、各程序流量占比等），支持锁定置顶、关闭面板不影响悬浮窗。
+  - 鼠标左键按住任意拖动位置并自动记忆坐标；防手抖微移保护；支持锁定防误触；支持单行横条 / 双行卡片双布局；支持调节透明度与鼠标悬停详细数据 Tooltip。
+  - 右键菜单提供一键打开 APP 详情面板、网页分析仪表盘、样式切换、透明度调节及一键完全退出。
+- 📊 **现代化暗色 Web 仪表盘**：
   内置单文件响应式前端界面（访问 `http://127.0.0.1:8899`），支持暗黑质感设计、历史柱状图趋势展示。
 
 ---
@@ -57,34 +63,45 @@
 
 ### 3. 启动与停止运行
 
-#### 方式 A：双击批处理快捷启动（推荐）
-直接双击运行根目录下的 [`start_monitor.bat`](start_monitor.bat)。它会自动拉起后台监控、**自动隐藏/关闭控制台命令行黑框**，并在默认浏览器打开仪表盘。
+#### 方式 A：启动桌面极简置顶悬浮窗 & APP 详情面板（强烈推荐日常使用）
+- **直接双击桌面上的快捷方式「`NetMonitor 悬浮窗.lnk`」**，或运行根目录下的 [`start_mini.bat`](start_mini.bat) / [`start_mini_silent.vbs`](start_mini_silent.vbs)。
+- 悬浮窗将直接以 **原生桌面 APP 形式** 浮现在 Windows 桌面最前端：
+  - 显示：**当前实时下载速率**、**当前实时上传速率**、**当日累计总流量**。
+  - **双击交互**：双击悬浮窗（或双击桌面图标）即可立即弹出**原生桌面 APP 监控中心**（展示进程网速排行与今日消耗 TOP 50）。
+  - **位置拖拽**：鼠标左键按住悬浮窗任意位置即可移动，松开自动保存记忆坐标。
+  - **右键菜单**：随时打开 APP 详情面板、切换单行/双行布局、调节透明度、锁定位置、开启/关闭置顶。
+  - 若后台服务尚未启动，迷你悬浮窗将自动在后台静默拉起数据采集，开箱即用。
 
-#### 方式 B：纯静默启动（完全无黑框闪烁）
-双击运行 [`start_monitor_silent.vbs`](start_monitor_silent.vbs)，无任何窗口闪烁，后台静默拉起并打开浏览器。
+#### 方式 B：双击批处理同时启动监控与网页（传统方式）
+直接双击运行根目录下的 [`start_monitor.bat`](start_monitor.bat)。它会自动拉起后台监控与悬浮窗，并在默认浏览器打开仪表盘。
 
-#### 方式 C：终端命令行启动
+#### 方式 C：纯静默启动
+双击运行 [`start_monitor_silent.vbs`](start_monitor_silent.vbs)，无任何窗口闪烁，后台静默拉起监控与悬浮窗并打开浏览器。
+
+#### 方式 D：终端命令行启动
 ```powershell
-# 后台静默启动（自动隐藏控制台黑框）
+# 仅启动桌面悬浮窗 APP
+python mini_widget.py
+# 或通过主程序参数启动
+python monitor.py --mini
+
+# 后台静默启动主服务（自动隐藏控制台黑框）
 python monitor.py
 
 # 调试模式（保持命令行窗口显示与实时日志）
 python monitor.py --show
 
-# 停止后台监控服务
+# 停止后台监控服务及悬浮窗
 python monitor.py --stop
 ```
 
 #### 停止服务
-双击运行根目录下的 [`stop_monitor.bat`](stop_monitor.bat) 即可一键安全停止所有后台运行的 NetMonitor 进程。
-
-#### 方式 D：开启 / 取消开机自动启动
-- **开启开机自启**：双击运行根目录下的 [`enable_autostart.bat`](enable_autostart.bat)，或在终端执行 `python monitor.py --autostart`。开机时将在后台完全静默启动（不弹黑框，不干扰弹出浏览器）。
-- **取消开机自启**：双击运行根目录下的 [`disable_autostart.bat`](disable_autostart.bat)，或在终端执行 `python monitor.py --no-autostart`。
-- **任务管理器管理**：也可在 Windows **任务管理器 -> 启动应用** 中随时启用或禁用 `NetMonitor`。
+双击运行根目录下的 [`stop_monitor.bat`](stop_monitor.bat) 即可一键安全停止所有后台运行的 NetMonitor 进程与悬浮窗。
 
 #### 方式 E：一键创建桌面快捷方式
-- 双击运行根目录下的 [`create_desktop_shortcut.bat`](create_desktop_shortcut.bat)，即可在桌面生成配备专属图标的 `NetMonitor.lnk` 快捷方式（双击后自动静默拉起监控服务并在默认浏览器打开仪表盘）。
+- 双击运行根目录下的 [`create_desktop_shortcut.bat`](create_desktop_shortcut.bat)，即可在桌面同时生成：
+  - `NetMonitor 悬浮窗.lnk`（桌面极简悬浮小组件 APP）
+  - `NetMonitor.lnk`（完整 Web 分析中心）
 
 启动成功后，浏览器随时访问：👉 **http://127.0.0.1:8899**
 

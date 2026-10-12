@@ -44,3 +44,6 @@ ENV/
 *~
 .DS_Store
 Thumbs.db
+
+# Mini Widget runtime configuration
+mini_config.json
