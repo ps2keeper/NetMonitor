@@ -56,10 +56,40 @@ def init_db():
             download_bytes INTEGER
         )
     """)
+    # 代理 / 直连 分流统计（route: 'proxy' | 'direct'，node 为实际出站节点名）
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS route_traffic (
+            date_str TEXT,
+            hour_str TEXT,
+            route TEXT,
+            node TEXT,
+            upload_bytes INTEGER,
+            download_bytes INTEGER,
+            PRIMARY KEY (date_str, hour_str, route, node)
+        )
+    """)
+    for col in ("proxy_bytes", "direct_bytes"):
+        try:
+            c.execute(f"ALTER TABLE process_traffic ADD COLUMN {col} INTEGER DEFAULT 0")
+        except Exception:
+            pass
     c.execute("CREATE INDEX IF NOT EXISTS idx_proc_date ON process_traffic(date_str)")
     c.execute("CREATE INDEX IF NOT EXISTS idx_proc_name ON process_traffic(process_name)")
+    c.execute("CREATE INDEX IF NOT EXISTS idx_route_date ON route_traffic(date_str)")
     conn.commit()
     conn.close()
+
+def classify_route(conn):
+    """根据 Mihomo 连接的 chains 判断出站类型。chains[0] 为最终实际出站（节点或 DIRECT/REJECT）"""
+    chains = conn.get("chains") or []
+    node = chains[0] if chains else "DIRECT"
+    up = str(node).upper()
+    if up.startswith("REJECT"):
+        return "reject", node
+    if up == "DIRECT":
+        return "direct", "DIRECT"
+    return "proxy", node
+
 
 # --- 流量收集器 ---
 class TrafficCollector(threading.Thread):
@@ -70,8 +100,13 @@ class TrafficCollector(threading.Thread):
             "current_down_speed": 0,
             "current_up_speed": 0,
             "process_speeds": {},
+            "proxy_down_speed": 0,
+            "proxy_up_speed": 0,
+            "direct_down_speed": 0,
+            "direct_up_speed": 0,
             "last_updated": time.time()
         }
+        self.first_poll = True
         self.lock = threading.Lock()
 
     def run(self):
@@ -101,9 +136,15 @@ class TrafficCollector(threading.Thread):
 
                 db_records_to_update = []
                 closed_conns_to_save = []
+                route_deltas = {}  # (route, node) -> [up, down]
+                route_speed = {"proxy": [0, 0], "direct": [0, 0]}
 
                 date_str = datetime.now().strftime("%Y-%m-%d")
                 hour_str = datetime.now().strftime("%H")
+
+                is_initial_seed = self.first_poll
+                self.first_poll = False
+                seed_proc_routes = []
 
                 for conn in current_conns_list:
                     cid = conn.get("id")
@@ -117,11 +158,18 @@ class TrafficCollector(threading.Thread):
                     proc = meta.get("process") or os.path.basename(meta.get("processPath") or "") or "系统/未知"
                     path = meta.get("processPath") or ""
                     host = meta.get("host") or meta.get("destinationIP") or "Unknown"
+                    route, node = classify_route(conn)
 
                     if cid in self.active_conns:
                         prev = self.active_conns[cid]
                         delta_up = max(cur_up - prev["upload"], 0)
                         delta_down = max(cur_down - prev["download"], 0)
+                    elif is_initial_seed:
+                        # 服务启动首次轮询：仅登记基准水位，避免重启服务重复累加存量长连接流量
+                        delta_up = 0
+                        delta_down = 0
+                        if route != "reject" and (cur_up + cur_down) > 0:
+                            seed_proc_routes.append((proc, host, route, cur_up + cur_down))
                     else:
                         delta_up = cur_up
                         delta_down = cur_down
@@ -138,13 +186,40 @@ class TrafficCollector(threading.Thread):
                         total_down_delta += delta_down
                         total_up_delta += delta_up
                         if proc not in proc_deltas:
-                            proc_deltas[proc] = {"up": 0, "down": 0}
+                            proc_deltas[proc] = {
+                                "up": 0, "down": 0,
+                                "proxy_up": 0, "proxy_down": 0,
+                                "direct_up": 0, "direct_down": 0,
+                                "nodes": set()
+                            }
                         proc_deltas[proc]["up"] += delta_up
                         proc_deltas[proc]["down"] += delta_down
 
+                        delta_tot = delta_up + delta_down
+                        p_bytes = delta_tot if route == "proxy" else 0
+                        d_bytes = delta_tot if route == "direct" else 0
+
+                        if route == "proxy":
+                            proc_deltas[proc]["proxy_up"] += delta_up
+                            proc_deltas[proc]["proxy_down"] += delta_down
+                            proc_deltas[proc]["nodes"].add(node)
+                        elif route == "direct":
+                            proc_deltas[proc]["direct_up"] += delta_up
+                            proc_deltas[proc]["direct_down"] += delta_down
+
                         db_records_to_update.append((
-                            date_str, hour_str, proc, path, host, delta_up, delta_down
+                            date_str, hour_str, proc, path, host, delta_up, delta_down, p_bytes, d_bytes
                         ))
+
+                        if route != "reject":
+                            rd = route_deltas.setdefault((route, node), [0, 0])
+                            rd[0] += delta_up
+                            rd[1] += delta_down
+                            route_speed[route][0] += delta_up
+                            route_speed[route][1] += delta_down
+
+                if is_initial_seed and seed_proc_routes:
+                    self.backfill_initial_proc_routes(date_str, seed_proc_routes)
 
                 closed_ids = set(self.active_conns.keys()) - seen_ids
                 for cid in closed_ids:
@@ -174,35 +249,90 @@ class TrafficCollector(threading.Thread):
                     self.realtime_stats["process_speeds"] = {
                         p: {
                             "up": d["up"] / time_delta,
-                            "down": d["down"] / time_delta
+                            "down": d["down"] / time_delta,
+                            "proxy_speed": (d["proxy_up"] + d["proxy_down"]) / time_delta,
+                            "direct_speed": (d["direct_up"] + d["direct_down"]) / time_delta,
+                            "route": (
+                                "proxy" if (d["proxy_up"] + d["proxy_down"]) > 0 and (d["direct_up"] + d["direct_down"]) == 0
+                                else ("direct" if (d["direct_up"] + d["direct_down"]) > 0 and (d["proxy_up"] + d["proxy_down"]) == 0 else "mixed")
+                            ),
+                            "node": ", ".join(sorted(d["nodes"])) if d["nodes"] else "DIRECT"
                         }
                         for p, d in proc_deltas.items()
                     }
+                    self.realtime_stats["proxy_up_speed"] = route_speed["proxy"][0] / time_delta
+                    self.realtime_stats["proxy_down_speed"] = route_speed["proxy"][1] / time_delta
+                    self.realtime_stats["direct_up_speed"] = route_speed["direct"][0] / time_delta
+                    self.realtime_stats["direct_down_speed"] = route_speed["direct"][1] / time_delta
                     self.realtime_stats["last_updated"] = now
 
-                if db_records_to_update or closed_conns_to_save:
-                    self.save_to_db(db_records_to_update, closed_conns_to_save)
+                route_rows = [
+                    (date_str, hour_str, r, n, v[0], v[1]) for (r, n), v in route_deltas.items()
+                ]
+                if db_records_to_update or closed_conns_to_save or route_rows:
+                    self.save_to_db(db_records_to_update, closed_conns_to_save, route_rows)
 
             except Exception:
                 pass
 
             time.sleep(POLL_INTERVAL)
 
-    def save_to_db(self, hourly_deltas, closed_conns):
+    def backfill_initial_proc_routes(self, date_str, seed_proc_routes):
+        """首次启动时，若今日进程表尚未记录代理/直连拆分，按当前活跃连接特征做一次性回填（不增加总流量）"""
+        try:
+            conn = sqlite3.connect(DB_FILE, timeout=5)
+            c = conn.cursor()
+            c.execute(
+                "SELECT COALESCE(SUM(COALESCE(proxy_bytes,0) + COALESCE(direct_bytes,0)), 0) FROM process_traffic WHERE date_str = ?",
+                (date_str,)
+            )
+            already = c.fetchone()[0] or 0
+            if already == 0:
+                proc_route_map = {}
+                for proc, host, route, tot_b in seed_proc_routes:
+                    st = proc_route_map.setdefault((proc, host), {"proxy": 0, "direct": 0})
+                    if route in st:
+                        st[route] += tot_b
+                # 对当日已有行按 host 特征做回填
+                c.execute(
+                    "SELECT rowid, process_name, host, upload_bytes + download_bytes FROM process_traffic WHERE date_str = ?",
+                    (date_str,)
+                )
+                for rowid, p_name, h_name, row_tot in c.fetchall():
+                    st = proc_route_map.get((p_name, h_name))
+                    if st and (st["proxy"] + st["direct"]) > 0:
+                        ratio_p = st["proxy"] / (st["proxy"] + st["direct"])
+                        pb = int(round(row_tot * ratio_p))
+                        db_val = max(row_tot - pb, 0)
+                        c.execute(
+                            "UPDATE process_traffic SET proxy_bytes = ?, direct_bytes = ? WHERE rowid = ?",
+                            (pb, db_val, rowid)
+                        )
+                conn.commit()
+            conn.close()
+        except Exception:
+            pass
+
+    def save_to_db(self, hourly_deltas, closed_conns, route_rows=()):
         try:
             conn = sqlite3.connect(DB_FILE, timeout=5)
             c = conn.cursor()
             
-            for date_str, hour_str, proc, path, host, delta_up, delta_down in hourly_deltas:
+            for date_str, hour_str, proc, path, host, delta_up, delta_down, p_bytes, d_bytes in hourly_deltas:
                 c.execute("""
-                    INSERT INTO process_traffic (date_str, hour_str, process_name, process_path, host, upload_bytes, download_bytes)
-                    VALUES (?, ?, ?, ?, ?, ?, ?)
+                    INSERT INTO process_traffic (
+                        date_str, hour_str, process_name, process_path, host,
+                        upload_bytes, download_bytes, proxy_bytes, direct_bytes
+                    )
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
                     ON CONFLICT(date_str, hour_str, process_name, host)
                     DO UPDATE SET
                         upload_bytes = upload_bytes + excluded.upload_bytes,
                         download_bytes = download_bytes + excluded.download_bytes,
+                        proxy_bytes = COALESCE(proxy_bytes, 0) + excluded.proxy_bytes,
+                        direct_bytes = COALESCE(direct_bytes, 0) + excluded.direct_bytes,
                         process_path = COALESCE(excluded.process_path, process_traffic.process_path)
-                """, (date_str, hour_str, proc, path, host, delta_up, delta_down))
+                """, (date_str, hour_str, proc, path, host, delta_up, delta_down, p_bytes, d_bytes))
 
             for conn_data in closed_conns:
                 c.execute("""
@@ -211,10 +341,46 @@ class TrafficCollector(threading.Thread):
                     ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """, conn_data)
 
+            for row in route_rows:
+                c.execute("""
+                    INSERT INTO route_traffic (date_str, hour_str, route, node, upload_bytes, download_bytes)
+                    VALUES (?, ?, ?, ?, ?, ?)
+                    ON CONFLICT(date_str, hour_str, route, node)
+                    DO UPDATE SET
+                        upload_bytes = upload_bytes + excluded.upload_bytes,
+                        download_bytes = download_bytes + excluded.download_bytes
+                """, row)
+
             conn.commit()
             conn.close()
         except Exception:
             pass
+
+def query_route_split(c, where_sql, params, node_limit=0):
+    """汇总 route_traffic：返回 proxy / direct 的上下行与总量，可选附带代理节点排行"""
+    res = {
+        "proxy": {"upload": 0, "download": 0, "total": 0},
+        "direct": {"upload": 0, "download": 0, "total": 0},
+    }
+    c.execute(f"""
+        SELECT route, COALESCE(SUM(upload_bytes), 0), COALESCE(SUM(download_bytes), 0)
+        FROM route_traffic {where_sql} GROUP BY route
+    """, params)
+    for route, ul, dl in c.fetchall():
+        if route in res:
+            res[route] = {"upload": ul, "download": dl, "total": ul + dl}
+    if node_limit:
+        c.execute(f"""
+            SELECT node, COALESCE(SUM(upload_bytes), 0), COALESCE(SUM(download_bytes), 0),
+                   COALESCE(SUM(upload_bytes + download_bytes), 0) AS tot
+            FROM route_traffic {where_sql} {"AND" if where_sql else "WHERE"} route = 'proxy'
+            GROUP BY node ORDER BY tot DESC LIMIT {int(node_limit)}
+        """, params)
+        res["nodes"] = [
+            {"node": n, "upload": ul, "download": dl, "total": t} for n, ul, dl, t in c.fetchall()
+        ]
+    return res
+
 
 # --- 网站图标与仪表盘 ---
 FAVICON_SVG = """<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 32 32">
@@ -289,6 +455,147 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
             --shadow-card: 0 4px 20px -2px rgba(0, 0, 0, 0.45), 0 0 0 1px rgba(255, 255, 255, 0.05);
             --shadow-card-hover: 0 8px 30px -4px rgba(0, 0, 0, 0.6), 0 0 0 1px rgba(56, 189, 248, 0.25);
             --shadow-dropdown: 0 10px 25px -5px rgba(0, 0, 0, 0.6), 0 0 0 1px rgba(255, 255, 255, 0.1);
+        }
+
+        [data-theme="light"] {
+            --bg-base: #f1f5f9;
+            --surface-card: #ffffff;
+            --surface-card-hover: #f8fafc;
+            --surface-elevated: #f1f5f9;
+            --surface-elevated-hover: #e2e8f0;
+            --surface-input: #f8fafc;
+            --surface-subtle: rgba(15, 23, 42, 0.03);
+            --border-subtle: #e2e8f0;
+            --border-card: #cbd5e1;
+            --border-hover: rgba(37, 99, 235, 0.45);
+            --border-focus: #2563eb;
+            --text-main: #0f172a;
+            --text-sub: #475569;
+            --text-muted: #64748b;
+            --text-faint: #94a3b8;
+            --brand: #2563eb;
+            --brand-tint: rgba(37, 99, 235, 0.1);
+            --brand-border: rgba(37, 99, 235, 0.25);
+            --down: #059669;
+            --down-tint: rgba(5, 150, 105, 0.1);
+            --down-border: rgba(5, 150, 105, 0.25);
+            --up: #0284c7;
+            --up-tint: rgba(2, 132, 199, 0.1);
+            --up-border: rgba(2, 132, 199, 0.25);
+            --warn: #d97706;
+            --warn-tint: rgba(217, 119, 6, 0.1);
+            --warn-border: rgba(217, 119, 6, 0.25);
+            --danger: #dc2626;
+            --danger-tint: rgba(220, 38, 38, 0.1);
+            --danger-border: rgba(220, 38, 38, 0.25);
+            --shadow-sm: 0 1px 2px 0 rgba(15, 23, 42, 0.05);
+            --shadow-card: 0 4px 14px -2px rgba(15, 23, 42, 0.06), 0 1px 3px 0 rgba(15, 23, 42, 0.04);
+            --shadow-card-hover: 0 8px 24px -4px rgba(37, 99, 235, 0.12), 0 2px 6px -1px rgba(15, 23, 42, 0.05);
+            --shadow-dropdown: 0 10px 25px -5px rgba(15, 23, 42, 0.12);
+        }
+
+        [data-theme="morandi"] {
+            --bg-base: #e8eee6;
+            --surface-card: #f6f9f5;
+            --surface-card-hover: #edf3eb;
+            --surface-elevated: #e2ece0;
+            --surface-elevated-hover: #d5e2d2;
+            --surface-input: #eef4ec;
+            --surface-subtle: rgba(28, 43, 33, 0.035);
+            --border-subtle: #d3e0cf;
+            --border-card: #bfd0ba;
+            --border-hover: rgba(46, 139, 110, 0.5);
+            --border-focus: #2e8b6e;
+            --text-main: #1c2b21;
+            --text-sub: #486050;
+            --text-muted: #688070;
+            --text-faint: #8ca393;
+            --brand: #2e8b6e;
+            --brand-tint: rgba(46, 139, 110, 0.12);
+            --brand-border: rgba(46, 139, 110, 0.28);
+            --down: #047857;
+            --down-tint: rgba(4, 120, 87, 0.1);
+            --down-border: rgba(4, 120, 87, 0.25);
+            --up: #0369a1;
+            --up-tint: rgba(3, 105, 161, 0.1);
+            --up-border: rgba(3, 105, 161, 0.25);
+            --warn: #b45309;
+            --warn-tint: rgba(180, 83, 9, 0.1);
+            --warn-border: rgba(180, 83, 9, 0.25);
+            --danger: #b91c1c;
+            --danger-tint: rgba(185, 28, 28, 0.1);
+            --danger-border: rgba(185, 28, 28, 0.25);
+            --shadow-sm: 0 1px 2px 0 rgba(28, 43, 33, 0.05);
+            --shadow-card: 0 4px 14px -2px rgba(28, 43, 33, 0.06);
+            --shadow-card-hover: 0 8px 24px -4px rgba(46, 139, 110, 0.14);
+        }
+
+        [data-theme="warm"] {
+            --bg-base: #efeae1;
+            --surface-card: #faf7f0;
+            --surface-card-hover: #f3eee4;
+            --surface-elevated: #eae2d3;
+            --surface-elevated-hover: #dfd5c3;
+            --surface-input: #f5f0e6;
+            --surface-subtle: rgba(41, 37, 36, 0.035);
+            --border-subtle: #e4dac7;
+            --border-card: #d5c9b4;
+            --border-hover: rgba(180, 83, 9, 0.45);
+            --border-focus: #b45309;
+            --text-main: #292524;
+            --text-sub: #57534e;
+            --text-muted: #78716c;
+            --text-faint: #a8a29e;
+            --brand: #b45309;
+            --brand-tint: rgba(180, 83, 9, 0.12);
+            --brand-border: rgba(180, 83, 9, 0.28);
+            --down: #15803d;
+            --down-tint: rgba(21, 128, 61, 0.1);
+            --down-border: rgba(21, 128, 61, 0.25);
+            --up: #0369a1;
+            --up-tint: rgba(3, 105, 161, 0.1);
+            --up-border: rgba(3, 105, 161, 0.25);
+            --warn: #b45309;
+            --warn-tint: rgba(180, 83, 9, 0.1);
+            --warn-border: rgba(180, 83, 9, 0.25);
+            --danger: #b91c1c;
+            --danger-tint: rgba(185, 28, 28, 0.1);
+            --danger-border: rgba(185, 28, 28, 0.25);
+            --shadow-sm: 0 1px 2px 0 rgba(41, 37, 36, 0.05);
+            --shadow-card: 0 4px 14px -2px rgba(41, 37, 36, 0.06);
+            --shadow-card-hover: 0 8px 24px -4px rgba(180, 83, 9, 0.14);
+        }
+
+        [data-theme="ocean"] {
+            --bg-base: #04101c;
+            --surface-card: #081b2e;
+            --surface-card-hover: #0b2239;
+            --surface-elevated: #0f2b47;
+            --surface-elevated-hover: #15385c;
+            --surface-input: #061524;
+            --border-subtle: rgba(56, 189, 248, 0.12);
+            --border-card: #163a5f;
+            --text-main: #f0f9ff;
+            --text-sub: #7dd3fc;
+            --text-muted: #528ab5;
+            --brand: #38bdf8;
+        }
+
+        [data-theme="cyber"] {
+            --bg-base: #0c0617;
+            --surface-card: #150c28;
+            --surface-card-hover: #1b1033;
+            --surface-elevated: #241542;
+            --surface-elevated-hover: #301c57;
+            --surface-input: #100820;
+            --border-subtle: rgba(232, 121, 249, 0.14);
+            --border-card: #362060;
+            --text-main: #faf5ff;
+            --text-sub: #c4b5fd;
+            --text-muted: #8b6fc0;
+            --brand: #e879f9;
+            --brand-tint: rgba(232, 121, 249, 0.14);
+            --brand-border: rgba(232, 121, 249, 0.3);
         }
 
         * { box-sizing: border-box; margin: 0; padding: 0; }
@@ -432,22 +739,85 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
             border-color: var(--brand-border);
         }
 
-        /* 4 KPI Grid Cards */
+        /* 代理 / 直连 分流 */
+        .route-grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 14px; margin-top: 6px; }
+        @media (max-width: 900px) { .route-grid { grid-template-columns: 1fr; } }
+        .route-period { background: var(--surface-subtle); border: 1px solid var(--border-subtle); border-radius: 12px; padding: 14px 16px; }
+        .route-period-title { font-size: 12px; font-weight: 600; color: var(--text-sub); margin-bottom: 10px; letter-spacing: .5px; }
+        .route-bar { display: flex; height: 8px; border-radius: 999px; overflow: hidden; background: rgba(148,163,184,0.2); margin: 10px 0 12px; }
+        .route-bar .p { background: linear-gradient(90deg,#818cf8,#6366f1); }
+        .route-bar .d { background: linear-gradient(90deg,#34d399,#10b981); }
+        .route-row { display: flex; align-items: baseline; justify-content: space-between; font-size: 13px; padding: 3px 0; }
+        .route-row .lbl { display: flex; align-items: center; gap: 6px; color: var(--text-sub); }
+        .route-row .dot { width: 8px; height: 8px; border-radius: 50%; display: inline-block; }
+        .route-row .val { font-variant-numeric: tabular-nums; font-weight: 600; color: var(--text-main); }
+        .route-row .pct { color: var(--text-muted); font-weight: 400; margin-left: 6px; font-size: 12px; }
+        .route-sub { font-size: 11px; color: var(--text-muted); padding-left: 14px; font-variant-numeric: tabular-nums; }
+        .route-nodes-title { font-size: 12px; font-weight: 600; color: var(--text-sub); margin: 18px 0 8px; }
+        .route-nodes { display: flex; flex-direction: column; gap: 6px; }
+        .route-node { display: grid; grid-template-columns: minmax(140px, 260px) 1fr 90px; gap: 12px; align-items: center; font-size: 12.5px; }
+        .route-node .nm { color: var(--text-main); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+        .route-node .track { height: 6px; border-radius: 999px; background: rgba(148,163,184,0.2); overflow: hidden; }
+        .route-node .fill { height: 100%; background: linear-gradient(90deg,#818cf8,#6366f1); }
+        .route-node .nv { text-align: right; font-variant-numeric: tabular-nums; color: var(--text-sub); }
+        .route-empty { font-size: 12px; color: #64748b; }
+        .route-note { font-size: 11px; color: #64748b; margin-top: 14px; }
+
+        /* 5 KPI Grid Cards - Fixed Equal Columns, Usage First, Realtime Last */
         .grid-4 {
             display: grid;
-            grid-template-columns: repeat(auto-fit, minmax(250px, 1fr));
+            grid-template-columns: repeat(5, minmax(0, 1fr));
             gap: 16px;
             margin-bottom: 24px;
         }
+        @media (max-width: 1280px) {
+            .grid-4 { grid-template-columns: repeat(auto-fit, minmax(230px, 1fr)); }
+        }
         .kpi-card {
             background: var(--surface-card);
-            border-radius: 12px;
+            border-radius: 14px;
             padding: 18px 20px;
             border: 1px solid var(--border-card);
             box-shadow: var(--shadow-card);
-            transition: transform 0.15s ease, box-shadow 0.15s ease, border-color 0.15s ease;
+            transition: transform 0.18s cubic-bezier(0.16, 1, 0.3, 1), box-shadow 0.18s ease, border-color 0.18s ease;
             position: relative;
             overflow: hidden;
+            min-height: 132px;
+            display: flex;
+            flex-direction: column;
+            justify-content: space-between;
+        }
+        .kpi-card::before {
+            content: "";
+            position: absolute;
+            top: 0; left: 0; right: 0;
+            height: 2px;
+            background: linear-gradient(90deg, var(--brand), rgba(56, 189, 248, 0.15));
+            opacity: 0.85;
+        }
+        .kpi-card.kpi-card-today::before { background: linear-gradient(90deg, #f59e0b, #fbbf24); }
+        .kpi-card.kpi-card-yesterday::before { background: linear-gradient(90deg, #a855f7, #818cf8); }
+        .kpi-card.kpi-card-month::before { background: linear-gradient(90deg, #14b8a6, #34d399); }
+        .kpi-card.kpi-card-all::before { background: linear-gradient(90deg, #3b82f6, #38bdf8); }
+        .kpi-card.kpi-card-live::before { background: linear-gradient(90deg, #10b981, #38bdf8); }
+        #live-down-chip, #live-up-chip {
+            min-width: 98px;
+            justify-content: center;
+        }
+        #route-live-chip {
+            min-width: 245px;
+            justify-content: center;
+            font-variant-numeric: tabular-nums;
+        }
+        #live-proc-count {
+            min-width: 68px;
+            text-align: center;
+            font-variant-numeric: tabular-nums;
+        }
+        .live-table-wrap {
+            min-height: 210px;
+            max-height: 380px;
+            overflow-y: auto;
         }
         .kpi-card:hover {
             border-color: rgba(255, 255, 255, 0.12);
@@ -1047,6 +1417,14 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
                 <span class="status-dot"></span>
                 <span id="status-text">监控运行中</span>
             </div>
+            <select class="filter-select" id="theme-select" onchange="onThemeChanged(this.value)" title="切换页面与悬浮窗主题风格" style="font-weight:600;">
+                <option value="dark">🌙 深邃曜石 (深色)</option>
+                <option value="light">☀️ 淡雅素白 (浅色)</option>
+                <option value="morandi">🍵 莫兰迪青瓷 (护眼)</option>
+                <option value="warm">☕ 暖砂羊皮 (柔和)</option>
+                <option value="ocean">🌊 深海极光 (蓝调)</option>
+                <option value="cyber">💜 赛博霓虹 (暗紫)</option>
+            </select>
             <button class="btn-ghost" id="btn-pause" onclick="toggleAutoRefresh()">
                 <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
                     <rect x="6" y="4" width="4" height="16"></rect>
@@ -1071,39 +1449,13 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
         </div>
     </header>
 
-    <!-- 4 大核心统计 KPI 卡片 -->
+    <!-- 5 大核心统计 KPI 卡片（累计用量在前，实时速率在后，固定列宽防抖动） -->
     <div class="grid-4">
-        <!-- 卡片 1：实时网速 -->
-        <div class="kpi-card">
-            <div class="kpi-header">
-                <span class="kpi-title">实时全机吞吐速率</span>
-                <div class="kpi-icon-wrap kpi-icon-blue">
-                    <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-                        <polygon points="13 2 3 14 12 14 11 22 21 10 12 10 13 2"></polygon>
-                    </svg>
-                </div>
-            </div>
-            <div class="kpi-value" id="live-total-speed">
-                0.00 <span class="unit">KB/s</span>
-            </div>
-            <div class="kpi-sub">
-                <span class="chip chip-down" id="live-down-chip">
-                    <svg width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><line x1="12" y1="5" x2="12" y2="19"></line><polyline points="19 12 12 19 5 12"></polyline></svg>
-                    <span id="live-down">0.00 KB/s</span>
-                </span>
-                <span class="chip chip-up" id="live-up-chip">
-                    <svg width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><line x1="12" y1="19" x2="12" y2="5"></line><polyline points="5 12 12 5 19 12"></polyline></svg>
-                    <span id="live-up">0.00 KB/s</span>
-                </span>
-                <span class="chip chip-muted" style="margin-left:auto;">秒级刷新</span>
-            </div>
-        </div>
-
-        <!-- 卡片 2：今日总流量 -->
-        <div class="kpi-card">
+        <!-- 卡片 1（最前）：今日总流量 -->
+        <div class="kpi-card kpi-card-today">
             <div class="kpi-header">
                 <span class="kpi-title">今日共用总流量 (<span id="today-date-str">今日</span>)</span>
-                <div class="kpi-icon-wrap kpi-icon-green">
+                <div class="kpi-icon-wrap kpi-icon-amber">
                     <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
                         <rect x="3" y="4" width="18" height="18" rx="2" ry="2"></rect>
                         <line x1="16" y1="2" x2="16" y2="6"></line>
@@ -1112,7 +1464,7 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
                     </svg>
                 </div>
             </div>
-            <div class="kpi-value" id="today-total-str">
+            <div class="kpi-value" id="today-total-str" style="color:var(--warn);">
                 0.00 <span class="unit">MB</span>
             </div>
             <div class="kpi-sub">
@@ -1127,8 +1479,8 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
             </div>
         </div>
 
-        <!-- 卡片 3：昨日总流量 -->
-        <div class="kpi-card">
+        <!-- 卡片 2：昨日总流量 -->
+        <div class="kpi-card kpi-card-yesterday">
             <div class="kpi-header">
                 <span class="kpi-title">昨日共用总流量 (<span id="yesterday-date-str">昨日</span>)</span>
                 <div class="kpi-icon-wrap kpi-icon-purple">
@@ -1153,8 +1505,8 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
             </div>
         </div>
 
-        <!-- 卡片 4：上月累计流量 -->
-        <div class="kpi-card">
+        <!-- 卡片 3：上月累计流量 -->
+        <div class="kpi-card kpi-card-month">
             <div class="kpi-header">
                 <span class="kpi-title">上月累计总流量 (<span id="last-month-label-str">上月</span>)</span>
                 <div class="kpi-icon-wrap kpi-icon-teal">
@@ -1181,11 +1533,11 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
             </div>
         </div>
 
-        <!-- 卡片 5：历史累计流量 -->
-        <div class="kpi-card">
+        <!-- 卡片 4：历史累计流量 -->
+        <div class="kpi-card kpi-card-all">
             <div class="kpi-header">
                 <span class="kpi-title">历史监控累计总流量</span>
-                <div class="kpi-icon-wrap kpi-icon-amber">
+                <div class="kpi-icon-wrap kpi-icon-blue">
                     <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
                         <circle cx="12" cy="12" r="10"></circle>
                         <line x1="2" y1="12" x2="22" y2="12"></line>
@@ -1206,7 +1558,54 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
                 <span class="chip chip-muted" id="all-days-count" style="margin-left:auto;">0 天</span>
             </div>
         </div>
+
+        <!-- 卡片 5（最后）：实时网速（变化剧烈的数据置于末尾，固定槽位绝不影响前方布局） -->
+        <div class="kpi-card kpi-card-live">
+            <div class="kpi-header">
+                <span class="kpi-title">⚡ 实时全机吞吐速率</span>
+                <div class="kpi-icon-wrap kpi-icon-green">
+                    <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                        <polygon points="13 2 3 14 12 14 11 22 21 10 12 10 13 2"></polygon>
+                    </svg>
+                </div>
+            </div>
+            <div class="kpi-value" id="live-total-speed">
+                0.00 <span class="unit">KB/s</span>
+            </div>
+            <div class="kpi-sub" style="flex-wrap:nowrap;">
+                <span class="chip chip-down" id="live-down-chip">
+                    <svg width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><line x1="12" y1="5" x2="12" y2="19"></line><polyline points="19 12 12 19 5 12"></polyline></svg>
+                    <span id="live-down" class="tabular">0.00 KB/s</span>
+                </span>
+                <span class="chip chip-up" id="live-up-chip">
+                    <svg width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><line x1="12" y1="19" x2="12" y2="5"></line><polyline points="5 12 12 5 19 12"></polyline></svg>
+                    <span id="live-up" class="tabular">0.00 KB/s</span>
+                </span>
+            </div>
+        </div>
     </div>
+
+    <!-- 模块零：代理 / 直连 分流统计 -->
+    <section class="section-card" id="route-section">
+        <div class="section-header">
+            <div class="section-title">
+                <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="var(--brand)" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                    <polyline points="16 3 21 3 21 8"></polyline><line x1="4" y1="20" x2="21" y2="3"></line>
+                    <polyline points="21 16 21 21 16 21"></polyline><line x1="15" y1="15" x2="21" y2="21"></line><line x1="4" y1="4" x2="9" y2="9"></line>
+                </svg>
+                代理 / 直连 分流统计
+            </div>
+            <span class="chip chip-muted" id="route-live-chip">实时 代理 0 KB/s · 直连 0 KB/s</span>
+        </div>
+        <div class="route-grid">
+            <div class="route-period" data-period="today"><div class="route-period-title">今日</div><div class="route-body"></div></div>
+            <div class="route-period" data-period="yesterday"><div class="route-period-title">昨日</div><div class="route-body"></div></div>
+            <div class="route-period" data-period="this_month"><div class="route-period-title">本月</div><div class="route-body"></div></div>
+        </div>
+        <div class="route-nodes-title">今日代理节点流量排行</div>
+        <div id="route-nodes" class="route-nodes"><span class="route-empty">暂无代理流量</span></div>
+        <div class="route-note">按 Clash 实际出站判定：DIRECT 计为直连，其余节点计为代理（REJECT 不计）。分流统计自启用本功能后开始累计。</div>
+    </section>
 
     <!-- 模块一：每日流量汇总与历史趋势 -->
     <section class="section-card">
@@ -1261,15 +1660,16 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
                     <tr>
                         <th class="text-left" style="width: 140px;">日期</th>
                         <th class="text-right" style="width: 140px;">当天共用总流量</th>
-                        <th class="text-right" style="width: 130px;">下行下载</th>
-                        <th class="text-right" style="width: 130px;">上行上传</th>
-                        <th class="text-center" style="width: 120px;">活跃程序数</th>
+                        <th class="text-right" style="width: 120px;">下行下载</th>
+                        <th class="text-right" style="width: 120px;">上行上传</th>
+                        <th class="text-left" style="width: 210px;">代理 / 直连分流</th>
+                        <th class="text-center" style="width: 105px;">活跃程序数</th>
                         <th class="text-left">当天消耗最大程序 (Top 1)</th>
                         <th class="text-center" style="width: 110px;">操作</th>
                     </tr>
                 </thead>
                 <tbody id="daily-table-body">
-                    <tr><td colspan="7" class="text-center" style="padding: 24px; color: var(--text-muted);">正在加载每日数据...</td></tr>
+                    <tr><td colspan="8" class="text-center" style="padding: 24px; color: var(--text-muted);">正在加载每日数据...</td></tr>
                 </tbody>
             </table>
         </div>
@@ -1312,6 +1712,8 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
 
                 <select class="filter-select" id="sort-select" onchange="onSortChanged(this.value)">
                     <option value="total">按总流量降序</option>
+                    <option value="proxy">按代理流量降序</option>
+                    <option value="direct">按直连流量降序</option>
                     <option value="download">按下载流量降序</option>
                     <option value="upload">按上传流量降序</option>
                 </select>
@@ -1332,17 +1734,18 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
                 <thead>
                     <tr>
                         <th class="text-center" style="width: 56px;">排名</th>
-                        <th class="text-left" style="min-width: 260px;">程序名称及完整路径</th>
-                        <th class="text-right" style="width: 120px;">下载流量</th>
-                        <th class="text-right" style="width: 120px;">上传流量</th>
-                        <th class="text-right" style="width: 130px;">总流量</th>
-                        <th class="text-right" style="width: 150px;">流量占比</th>
+                        <th class="text-left" style="min-width: 250px;">程序名称及完整路径</th>
+                        <th class="text-right" style="width: 120px;">总流量</th>
+                        <th class="text-left" style="width: 200px;">代理 / 直连明细</th>
+                        <th class="text-right" style="width: 110px;">下载流量</th>
+                        <th class="text-right" style="width: 110px;">上传流量</th>
+                        <th class="text-right" style="width: 130px;">流量占比</th>
                         <th class="text-left">常访问主要域名与目标</th>
                         <th class="text-center" style="width: 110px;">状态标记</th>
                     </tr>
                 </thead>
                 <tbody id="ranking-table-body">
-                    <tr><td colspan="8" class="text-center" style="padding: 36px; color: var(--text-muted);">正在加载程序排名...</td></tr>
+                    <tr><td colspan="9" class="text-center" style="padding: 36px; color: var(--text-muted);">正在加载程序排名...</td></tr>
                 </tbody>
             </table>
         </div>
@@ -1359,19 +1762,20 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
                 <span class="badge badge-normal" id="live-proc-count">0 个活跃</span>
             </div>
         </div>
-        <div class="table-wrap">
-            <table>
+        <div class="table-wrap live-table-wrap">
+            <table style="table-layout: fixed;">
                 <thead>
                     <tr>
-                        <th class="text-left" style="width: 260px;">程序名称</th>
-                        <th class="text-right" style="width: 160px;">当前下行速率</th>
-                        <th class="text-right" style="width: 160px;">当前上行速率</th>
-                        <th class="text-center" style="width: 140px;">瞬时状态</th>
+                        <th class="text-left" style="width: 240px;">程序名称</th>
+                        <th class="text-left" style="width: 220px;">当前分流走向 / 节点</th>
+                        <th class="text-right" style="width: 145px;">当前下行速率</th>
+                        <th class="text-right" style="width: 145px;">当前上行速率</th>
+                        <th class="text-center" style="width: 130px;">瞬时状态</th>
                     </tr>
                 </thead>
                 <tbody id="live-table-body">
                     <tr>
-                        <td colspan="4">
+                        <td colspan="5">
                             <div class="empty-state">
                                 <div class="empty-icon">
                                     <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
@@ -1393,6 +1797,33 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
     <script>
         let currentDateFilter = 'today';
         let currentSort = 'total';
+
+        function applyWebTheme(themeKey, syncBackend = false) {
+            const validThemes = ['dark', 'light', 'morandi', 'warm', 'ocean', 'cyber'];
+            const t = validThemes.includes(themeKey) ? themeKey : 'dark';
+            if (t === 'dark') {
+                document.documentElement.removeAttribute('data-theme');
+            } else {
+                document.documentElement.setAttribute('data-theme', t);
+            }
+            localStorage.setItem('netmonitor_theme', t);
+            const sel = document.getElementById('theme-select');
+            if (sel && sel.value !== t) sel.value = t;
+            if (syncBackend) {
+                fetch('/api/theme?set=' + encodeURIComponent(t)).catch(() => {});
+            }
+        }
+
+        function onThemeChanged(val) {
+            applyWebTheme(val, true);
+        }
+
+        (function initThemeOnLoad() {
+            const urlParams = new URLSearchParams(window.location.search);
+            const urlTheme = urlParams.get('theme');
+            const savedTheme = localStorage.getItem('netmonitor_theme') || 'dark';
+            applyWebTheme(urlTheme || savedTheme, Boolean(urlTheme));
+        })();
         let currentSearch = '';
         let autoRefresh = true;
         let refreshTimer = null;
@@ -1598,8 +2029,55 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
             }
         }
 
+        // 渲染 代理 / 直连 分流
+        function renderRoute(data) {
+            const rt = data.realtime || {};
+            const chip = document.getElementById('route-live-chip');
+            if (chip) {
+                const ps = (rt.proxy_down_speed || 0) + (rt.proxy_up_speed || 0);
+                const ds = (rt.direct_down_speed || 0) + (rt.direct_up_speed || 0);
+                chip.innerText = `实时 代理 ${formatSpeed(ps)} · 直连 ${formatSpeed(ds)}`;
+            }
+            const rs = (data.overview || {}).route;
+            if (!rs) return;
+            document.querySelectorAll('#route-section .route-period').forEach(el => {
+                const r = rs[el.dataset.period];
+                if (!r) return;
+                const p = r.proxy || {}, d = r.direct || {};
+                const tot = (p.total || 0) + (d.total || 0);
+                const pp = tot ? (p.total / tot * 100) : 0;
+                const dp = tot ? (100 - pp) : 0;
+                el.querySelector('.route-body').innerHTML = `
+                    <div class="route-bar"><div class="p" style="width:${pp}%"></div><div class="d" style="width:${dp}%"></div></div>
+                    <div class="route-row"><span class="lbl"><span class="dot" style="background:#6366f1"></span>代理</span>
+                        <span class="val">${formatBytes(p.total || 0)}<span class="pct">${pp.toFixed(1)}%</span></span></div>
+                    <div class="route-sub">↓ ${formatBytes(p.download || 0)} · ↑ ${formatBytes(p.upload || 0)}</div>
+                    <div class="route-row"><span class="lbl"><span class="dot" style="background:#10b981"></span>直连</span>
+                        <span class="val">${formatBytes(d.total || 0)}<span class="pct">${dp.toFixed(1)}%</span></span></div>
+                    <div class="route-sub">↓ ${formatBytes(d.download || 0)} · ↑ ${formatBytes(d.upload || 0)}</div>`;
+            });
+            const nodes = (rs.today && rs.today.nodes) || [];
+            const box = document.getElementById('route-nodes');
+            if (box) {
+                if (!nodes.length) { box.innerHTML = '<span class="route-empty">今日暂无走代理的节点流量</span>'; return; }
+                const max = nodes[0].total || 1;
+                const proxySum = nodes.reduce((a, b) => a + (b.total || 0), 0) || 1;
+                const esc = t => String(t).replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
+                box.innerHTML = nodes.map(n => {
+                    const pct = (n.total / proxySum * 100).toFixed(1);
+                    return `
+                    <div class="route-node" style="grid-template-columns: minmax(160px, 260px) 1fr 220px;">
+                        <span class="nm" title="${esc(n.node)}">🌐 ${esc(n.node)}</span>
+                        <div class="track"><div class="fill" style="width:${(n.total / max * 100).toFixed(1)}%"></div></div>
+                        <span class="nv"><strong>${formatBytes(n.total)}</strong> <span style="color:#64748b;font-size:11px;">(↓${formatBytes(n.download||0)} ↑${formatBytes(n.upload||0)} · ${pct}%)</span></span>
+                    </div>`;
+                }).join('');
+            }
+        }
+
         // 渲染顶部 KPI
         function renderOverview(data) {
+            try { renderRoute(data); } catch (e) { console.error(e); }
             const rt = data.realtime || {};
             const ov = data.overview || {};
 
@@ -1747,6 +2225,13 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
                         <td class="text-right"><strong class="tabular" style="color:var(--brand); font-size:13px; font-weight:700;">${formatBytes(item.total)}</strong></td>
                         <td class="text-right tabular" style="color:var(--down); font-weight:500;">${formatBytes(item.download)}</td>
                         <td class="text-right tabular" style="color:var(--up); font-weight:500;">${formatBytes(item.upload)}</td>
+                        <td class="text-left tabular" style="font-size:12px;">
+                            ${(item.proxy || item.direct) ? `
+                                <span style="color:#818cf8;font-weight:600;">🌐 ${formatBytes(item.proxy || 0)}</span>
+                                <span style="color:#475569;margin:0 4px;">/</span>
+                                <span style="color:#34d399;font-weight:600;">🎯 ${formatBytes(item.direct || 0)}</span>
+                            ` : '<span style="color:var(--text-faint);">未记录分流</span>'}
+                        </td>
                         <td class="text-center"><span class="badge badge-normal tabular">${item.proc_count} 个</span></td>
                         <td class="text-left">
                             <strong style="color:var(--text-main); font-weight:600;">${item.top_process}</strong>
@@ -1785,7 +2270,8 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
 
             bannerName.innerText = dateDisplay;
             bannerDesc.innerText = `当天共用总流量：${formatBytes(data.selected_date_total || 0)}，累计上榜程序：${ranking.length} 个`;
-            bannerStats.innerText = currentSearch ? `搜索关键词: "${currentSearch}"` : `排序规则: ${currentSort === 'total' ? '总流量' : currentSort === 'download' ? '下行' : '上行'}`;
+            const sortMap = { total: '总流量', proxy: '代理流量', direct: '直连流量', download: '下行流量', upload: '上传流量' };
+            bannerStats.innerText = currentSearch ? `搜索关键词: "${currentSearch}"` : `排序规则: ${sortMap[currentSort] || '总流量'}`;
 
             const tbody = document.getElementById('ranking-table-body');
             if (ranking.length === 0) {
@@ -1838,9 +2324,29 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
                                 </div>
                             </div>
                         </td>
+                        <td class="text-right tabular"><strong style="color: var(--warn); font-size: 13px; font-weight: 700;">${formatBytes(item.total)}</strong></td>
+                        <td class="text-left tabular">
+                            ${(() => {
+                                const pb = item.proxy || 0;
+                                const db = item.direct || 0;
+                                const rtSum = pb + db;
+                                if (rtSum <= 0) return '<span style="color:var(--text-faint);font-size:12px;">-</span>';
+                                const pPct = (pb / rtSum * 100).toFixed(0);
+                                const dPct = 100 - Number(pPct);
+                                return `
+                                    <div style="display:flex;justify-content:space-between;font-size:11.5px;gap:6px;">
+                                        <span style="color:#818cf8;" title="走代理流量">🌐 ${formatBytes(pb)} (${pPct}%)</span>
+                                        <span style="color:#34d399;" title="走直连流量">🎯 ${formatBytes(db)}</span>
+                                    </div>
+                                    <div class="route-bar" style="height:5px;margin:4px 0 0;">
+                                        <div class="p" style="width:${pPct}%"></div>
+                                        <div class="d" style="width:${dPct}%"></div>
+                                    </div>
+                                `;
+                            })()}
+                        </td>
                         <td class="text-right tabular" style="color: var(--down); font-weight: 500;">${formatBytes(item.download)}</td>
                         <td class="text-right tabular" style="color: var(--up); font-weight: 500;">${formatBytes(item.upload)}</td>
-                        <td class="text-right tabular"><strong style="color: var(--text-main); font-size: 13px; font-weight: 700;">${formatBytes(item.total)}</strong></td>
                         <td class="text-right">
                             <div class="tabular" style="font-size:12px; font-weight:600; color:var(--text-main);">${item.pct}%</div>
                             <div class="progress-track">
@@ -1868,7 +2374,7 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
             if (liveEntries.length === 0) {
                 tbody.innerHTML = `
                     <tr>
-                        <td colspan="4">
+                        <td colspan="5">
                             <div class="empty-state">
                                 <div class="empty-icon">
                                     <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
@@ -1889,6 +2395,12 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
             tbody.innerHTML = liveEntries.map(([proc, s]) => {
                 const isHigh = (s.down > 1024 * 1024 || s.up > 1024 * 1024);
                 const avatar = getProcAvatar(proc);
+                let routeBadge = '<span class="badge badge-normal">🎯 直连 (DIRECT)</span>';
+                if (s.route === 'proxy') {
+                    routeBadge = `<span class="badge" style="background:rgba(99,102,241,0.18);color:#a5b4fc;border:1px solid rgba(99,102,241,0.35);">🌐 代理 · ${s.node || '节点'}</span>`;
+                } else if (s.route === 'mixed') {
+                    routeBadge = `<span class="badge" style="background:rgba(56,189,248,0.15);color:#38bdf8;border:1px solid rgba(56,189,248,0.3);">🔀 混合 (${s.node || '代理+直连'})</span>`;
+                }
                 return `
                     <tr>
                         <td class="text-left">
@@ -1899,6 +2411,7 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
                                 <div class="proc-name">${proc}</div>
                             </div>
                         </td>
+                        <td class="text-left">${routeBadge}</td>
                         <td class="text-right tabular" style="color: var(--down); font-weight: 600;">${formatSpeed(s.down)}</td>
                         <td class="text-right tabular" style="color: var(--up); font-weight: 600;">${formatSpeed(s.up)}</td>
                         <td class="text-center">
@@ -1970,6 +2483,28 @@ class WebHandler(http.server.BaseHTTPRequestHandler):
             self.wfile.write(FAVICON_SVG.encode("utf-8"))
             return
 
+        if parsed.path == "/api/theme":
+            qs = urllib.parse.parse_qs(parsed.query)
+            new_t = qs.get("set", [""])[0].strip()
+            cfg_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "mini_config.json")
+            if new_t in ("dark", "light", "morandi", "warm", "ocean", "cyber"):
+                try:
+                    cfg_data = {}
+                    if os.path.exists(cfg_path):
+                        with open(cfg_path, "r", encoding="utf-8") as cf:
+                            cfg_data = json.load(cf)
+                    cfg_data["theme"] = new_t
+                    with open(cfg_path, "w", encoding="utf-8") as cf:
+                        json.dump(cfg_data, cf, indent=2, ensure_ascii=False)
+                except Exception:
+                    pass
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json; charset=utf-8")
+            self.send_header("Access-Control-Allow-Origin", "*")
+            self.end_headers()
+            self.wfile.write(b'{"status":"ok"}')
+            return
+
         if parsed.path == "/api/mini/launch":
             base_dir = os.path.dirname(os.path.abspath(__file__))
             mini_script = os.path.join(base_dir, "mini_widget.py")
@@ -1995,7 +2530,11 @@ class WebHandler(http.server.BaseHTTPRequestHandler):
                 rt = {
                     "current_down_speed": collector.realtime_stats["current_down_speed"],
                     "current_up_speed": collector.realtime_stats["current_up_speed"],
-                    "process_speeds": collector.realtime_stats["process_speeds"].copy()
+                    "process_speeds": collector.realtime_stats["process_speeds"].copy(),
+                    "proxy_down_speed": collector.realtime_stats["proxy_down_speed"],
+                    "proxy_up_speed": collector.realtime_stats["proxy_up_speed"],
+                    "direct_down_speed": collector.realtime_stats["direct_down_speed"],
+                    "direct_up_speed": collector.realtime_stats["direct_up_speed"]
                 }
 
             today_str = datetime.now().strftime("%Y-%m-%d")
@@ -2030,15 +2569,17 @@ class WebHandler(http.server.BaseHTTPRequestHandler):
                     SELECT process_name, process_path,
                            COALESCE(SUM(download_bytes), 0) as dl,
                            COALESCE(SUM(upload_bytes), 0) as ul,
-                           COALESCE(SUM(download_bytes + upload_bytes), 0) as tot
+                           COALESCE(SUM(download_bytes + upload_bytes), 0) as tot,
+                           COALESCE(SUM(proxy_bytes), 0) as p_bytes,
+                           COALESCE(SUM(direct_bytes), 0) as d_bytes
                     FROM process_traffic
                     WHERE date_str = ?
                     GROUP BY process_name
                     ORDER BY tot DESC
-                    LIMIT 30
+                    LIMIT 50
                 """, (today_str,))
                 ranking = []
-                for idx, (p_name, p_path, dl, ul, tot) in enumerate(c.fetchall(), 1):
+                for idx, (p_name, p_path, dl, ul, tot, p_bytes, d_bytes) in enumerate(c.fetchall(), 1):
                     pct = round((tot / today_tot * 100), 2) if today_tot > 0 else 0
                     ranking.append({
                         "rank": idx,
@@ -2047,8 +2588,11 @@ class WebHandler(http.server.BaseHTTPRequestHandler):
                         "download": dl,
                         "upload": ul,
                         "total": tot,
+                        "proxy": p_bytes,
+                        "direct": d_bytes,
                         "pct": pct
                     })
+                route_today = query_route_split(c, "WHERE date_str = ?", (today_str,), node_limit=15)
                 conn.close()
 
                 overview_today = {
@@ -2056,7 +2600,8 @@ class WebHandler(http.server.BaseHTTPRequestHandler):
                         "download": t_dl,
                         "upload": t_ul,
                         "total": today_tot
-                    }
+                    },
+                    "route_today": route_today
                 }
 
                 with _mini_cache_lock:
@@ -2099,7 +2644,11 @@ class WebHandler(http.server.BaseHTTPRequestHandler):
                 rt = {
                     "current_down_speed": collector.realtime_stats["current_down_speed"],
                     "current_up_speed": collector.realtime_stats["current_up_speed"],
-                    "process_speeds": collector.realtime_stats["process_speeds"].copy()
+                    "process_speeds": collector.realtime_stats["process_speeds"].copy(),
+                    "proxy_down_speed": collector.realtime_stats["proxy_down_speed"],
+                    "proxy_up_speed": collector.realtime_stats["proxy_up_speed"],
+                    "direct_down_speed": collector.realtime_stats["direct_down_speed"],
+                    "direct_up_speed": collector.realtime_stats["direct_up_speed"]
                 }
 
             today_str = datetime.now().strftime("%Y-%m-%d")
@@ -2175,6 +2724,18 @@ class WebHandler(http.server.BaseHTTPRequestHandler):
             """)
             a_dl, a_ul, days_cnt = c.fetchone()
 
+            # 按日期汇总代理/直连流量映射表
+            c.execute("""
+                SELECT date_str, route, COALESCE(SUM(upload_bytes + download_bytes), 0)
+                FROM route_traffic
+                GROUP BY date_str, route
+            """)
+            daily_route_map = {}
+            for d_r, rt_type, rt_tot in c.fetchall():
+                daily_route_map.setdefault(d_r, {"proxy": 0, "direct": 0})
+                if rt_type in ("proxy", "direct"):
+                    daily_route_map[d_r][rt_type] = rt_tot
+
             # 6. 每日汇总列表 (限制最近 60 天，前 14 天计算 TOP 进程，避免全表扫描卡死)
             c.execute("""
                 SELECT date_str,
@@ -2204,11 +2765,14 @@ class WebHandler(http.server.BaseHTTPRequestHandler):
                         LIMIT 1
                     """, (d,))
                     top_p = c.fetchone()
+                dr = daily_route_map.get(d, {"proxy": 0, "direct": 0})
                 daily_summary.append({
                     "date": d,
                     "download": dl,
                     "upload": ul,
                     "total": tot,
+                    "proxy": dr["proxy"],
+                    "direct": dr["direct"],
                     "proc_count": cnt,
                     "top_process": top_p[0] if top_p else "-",
                     "top_process_bytes": top_p[1] if top_p else 0
@@ -2235,12 +2799,18 @@ class WebHandler(http.server.BaseHTTPRequestHandler):
                 order_col = "dl"
             elif sort_by == "upload":
                 order_col = "ul"
+            elif sort_by == "proxy":
+                order_col = "p_bytes"
+            elif sort_by == "direct":
+                order_col = "d_bytes"
 
             query = f"""
                 SELECT process_name, MAX(process_path),
                        SUM(download_bytes) as dl,
                        SUM(upload_bytes) as ul,
-                       SUM(download_bytes + upload_bytes) as total
+                       SUM(download_bytes + upload_bytes) as total,
+                       COALESCE(SUM(proxy_bytes), 0) as p_bytes,
+                       COALESCE(SUM(direct_bytes), 0) as d_bytes
                 FROM process_traffic
                 {where_sql}
                 GROUP BY process_name
@@ -2251,7 +2821,7 @@ class WebHandler(http.server.BaseHTTPRequestHandler):
             ranking_rows = c.fetchall()
 
             ranking = []
-            for rank_num, (proc, path, dl, ul, tot) in enumerate(ranking_rows, 1):
+            for rank_num, (proc, path, dl, ul, tot, p_bytes, d_bytes) in enumerate(ranking_rows, 1):
                 # 提取常访问目标
                 host_where = "WHERE date_str = ? AND process_name = ?" if actual_date != "all" else "WHERE process_name = ?"
                 host_params = (actual_date, proc) if actual_date != "all" else (proc,)
@@ -2272,15 +2842,29 @@ class WebHandler(http.server.BaseHTTPRequestHandler):
                     "download": dl,
                     "upload": ul,
                     "total": tot,
+                    "proxy": p_bytes,
+                    "direct": d_bytes,
                     "pct": round((tot / selected_date_total) * 100, 2),
                     "top_hosts": top_hosts
                 })
+
+            this_month_str = datetime.now().strftime("%Y-%m")
+            try:
+                route_split = {
+                    "today": query_route_split(c, "WHERE date_str = ?", (today_str,), node_limit=10),
+                    "yesterday": query_route_split(c, "WHERE date_str = ?", (yesterday_str,)),
+                    "this_month": query_route_split(c, "WHERE substr(date_str, 1, 7) = ?", (this_month_str,)),
+                    "month": this_month_str,
+                }
+            except Exception:
+                route_split = None
 
             conn.close()
 
             payload = {
                 "realtime": rt,
                 "overview": {
+                    "route": route_split,
                     "today": {
                         "date": today_str,
                         "download": t_dl,
