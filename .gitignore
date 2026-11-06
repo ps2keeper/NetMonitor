@@ -47,3 +47,7 @@ Thumbs.db
 
 # Mini Widget runtime configuration
 mini_config.json
+
+# Runtime state
+*.pid
+*.tmp

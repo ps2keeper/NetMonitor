@@ -32,6 +32,12 @@ import webbrowser
 import tkinter as tk
 from tkinter import ttk
 
+# 嵌入式/隔离模式的 Python 不会自动把脚本目录加入 sys.path
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+
+import nm_config  # noqa: E402
+import nm_windows  # noqa: E402
+
 # 确保附加到用户交互式默认桌面 (WinSta0\Default)，防止在受限桌面或后台环境中隐形
 if os.name == "nt":
     try:
@@ -49,14 +55,16 @@ if os.name == "nt":
         except Exception:
             pass
 
-# 基础配置与文件路径
-BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-CONFIG_FILE = os.path.join(BASE_DIR, "mini_config.json")
-ICON_FILE = os.path.join(BASE_DIR, "netmonitor.ico")
-LOG_FILE = os.path.join(BASE_DIR, "mini_widget.log")
-API_MINI_URL = os.environ.get("NETMONITOR_MINI_API", "http://127.0.0.1:8899/api/mini/stats")
-API_FULL_URL = os.environ.get("NETMONITOR_API", "http://127.0.0.1:8899/api/stats")
-IPC_PORT = 8897  # 本地进程间通信端口，用于已运行悬浮窗的即时唤醒
+# 基础配置与文件路径（端口、数据目录与 monitor.py 共用 nm_config）
+BASE_DIR = nm_config.APP_DIR
+CONFIG_FILE = nm_config.CONFIG_FILE
+ICON_FILE = nm_config.ICON_FILE
+LOG_FILE = nm_config.WIDGET_LOG
+LOG_MAX_BYTES = 1_000_000
+API_MINI_URL = os.environ.get("NETMONITOR_MINI_API", f"http://127.0.0.1:{nm_config.WEB_PORT}/api/mini/stats")
+API_FULL_URL = os.environ.get("NETMONITOR_API", f"http://127.0.0.1:{nm_config.WEB_PORT}/api/stats")
+IPC_PORT = nm_config.IPC_PORT  # 本地进程间通信端口，用于已运行悬浮窗的即时唤醒
+IPC_COMMANDS = (b"WAKE_DETAIL", b"EXIT")
 
 # 6 套精选多维主题配色方案（同时驱动桌面悬浮窗、Tooltip 与桌面监控中心 APP）
 THEMES = {
@@ -324,6 +332,9 @@ def get_theme(theme_key):
 def log_event(msg):
     """记录运行时关键诊断日志到 mini_widget.log"""
     try:
+        nm_config.ensure_data_dir()
+        if os.path.exists(LOG_FILE) and os.path.getsize(LOG_FILE) > LOG_MAX_BYTES:
+            os.replace(LOG_FILE, LOG_FILE + ".1")
         t = time.strftime("%Y-%m-%d %H:%M:%S")
         with open(LOG_FILE, "a", encoding="utf-8") as f:
             f.write(f"[{t}] [PID:{os.getpid()}] {msg}\n")
@@ -345,14 +356,11 @@ DEFAULT_CONFIG = {
 
 def load_config():
     cfg = DEFAULT_CONFIG.copy()
-    if os.path.exists(CONFIG_FILE):
-        try:
-            with open(CONFIG_FILE, "r", encoding="utf-8") as f:
-                saved = json.load(f)
-                if isinstance(saved, dict):
-                    cfg.update(saved)
-        except Exception:
-            pass
+    try:
+        nm_config.ensure_data_dir()
+    except OSError:
+        pass
+    cfg.update(nm_config.load_json_config())
     if cfg.get("theme") not in THEMES:
         cfg["theme"] = "dark"
     return cfg
@@ -360,10 +368,9 @@ def load_config():
 
 def save_config(cfg):
     try:
-        with open(CONFIG_FILE, "w", encoding="utf-8") as f:
-            json.dump(cfg, f, indent=2, ensure_ascii=False)
-    except Exception:
-        pass
+        nm_config.save_json_config(cfg)
+    except OSError as e:
+        log_event(f"保存配置失败: {e}")
 
 
 def format_speed(bps):
@@ -1051,7 +1058,7 @@ class DetailWindow:
             except Exception:
                 pass
         t_key = self.app.cfg.get("theme", "dark")
-        open_url_on_default_desktop(f"http://127.0.0.1:8899/?theme={t_key}")
+        open_url_on_default_desktop(nm_config.dashboard_url(t_key))
 
     def update_content(self):
         if not self.root.winfo_exists():
@@ -1100,10 +1107,18 @@ class DetailWindow:
 
             p_spd = format_speed(d.get("proxy_speed", 0))
             d_spd = format_speed(d.get("direct_speed", 0))
-            self.lbl_status.config(
-                text=f"🟢 服务连接正常  │  今日总计: {format_bytes(d['today_total'])} (代理 {p_pct:.1f}% / 直连 {d_pct:.1f}%)  │  实时代理: {p_spd} · 实时直连: {d_spd}",
-                fg=th["c_down"]
-            )
+            collector = d.get("collector") or {}
+            if collector.get("state", "ok") != "ok":
+                self.lbl_status.config(text=f"🟠 {collector.get('message', '采集异常')}", fg=th["c_today"])
+            elif collector.get("last_write_error"):
+                self.lbl_status.config(
+                    text=f"🟠 数据库写入失败，{collector.get('pending_rows', 0)} 组数据待重试：{collector['last_write_error']}",
+                    fg=th["c_today"])
+            else:
+                self.lbl_status.config(
+                    text=f"🟢 服务连接正常  │  今日总计: {format_bytes(d['today_total'])} (代理 {p_pct:.1f}% / 直连 {d_pct:.1f}%)  │  实时代理: {p_spd} · 实时直连: {d_spd}",
+                    fg=th["c_down"]
+                )
         else:
             self.card_td.lbl_val.config(text="连接中...")
             self.card_proxy.lbl_val.config(text="-")
@@ -1241,6 +1256,7 @@ class MiniWidgetApp:
             "route_today": None,
             "process_speeds": {},
             "ranking": [],
+            "collector": {},
             "connected": False
         }
         self.data_lock = threading.Lock()
@@ -1265,6 +1281,10 @@ class MiniWidgetApp:
 
         self.bind_events()
         self.start_ipc_server()
+        try:
+            nm_windows.write_pid(nm_config.WIDGET_PID)
+        except OSError:
+            pass
 
         self.fetch_thread = threading.Thread(target=self.background_fetch_loop, daemon=True)
         self.fetch_thread.start()
@@ -1276,7 +1296,11 @@ class MiniWidgetApp:
         """本地 IPC 监听：收到 WAKE_DETAIL 命令时立即弹出并聚焦详情窗口"""
         def ipc_loop():
             srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            # Windows 的 SO_REUSEADDR 允许多个进程同时绑定，必须用独占绑定才能保证单实例
+            if hasattr(socket, "SO_EXCLUSIVEADDRUSE"):
+                srv.setsockopt(socket.SOL_SOCKET, socket.SO_EXCLUSIVEADDRUSE, 1)
+            else:
+                srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
             try:
                 srv.bind(("127.0.0.1", IPC_PORT))
                 srv.listen(5)
@@ -1287,9 +1311,22 @@ class MiniWidgetApp:
             while self.running:
                 try:
                     conn, _ = srv.accept()
-                    data = conn.recv(1024)
-                    conn.close()
-                    if b"WAKE_DETAIL" in data:
+                    conn.settimeout(1.0)
+                    try:
+                        data = conn.recv(64)
+                    except OSError:
+                        data = b""
+                    finally:
+                        conn.close()
+                    # 只接受精确的单行命令：浏览器发来的 HTTP 请求（首行是 GET/POST ...）一律忽略
+                    command = data.split(b"\n", 1)[0].strip()
+                    if command not in IPC_COMMANDS:
+                        continue
+                    if command == b"EXIT":
+                        log_event("IPC 接收到 EXIT 指令，悬浮窗退出")
+                        self.root.after(0, self.close_widget)
+                        continue
+                    if command == b"WAKE_DETAIL":
                         log_event("IPC 接收到 WAKE_DETAIL 唤醒指令，正在置顶悬浮窗并调出详情窗口")
                         def wake_all():
                             try:
@@ -1562,6 +1599,9 @@ class MiniWidgetApp:
                 d = self.latest_data.copy()
             if not d["connected"]:
                 return "NetMonitor 服务连接中...\n(后台服务正在启动，稍候即连)"
+            collector = d.get("collector") or {}
+            if collector.get("state", "ok") != "ok":
+                return f"⚠ {collector.get('message', '采集异常')}"
 
             route_lines = ""
             rtd = d.get("route_today")
@@ -1608,7 +1648,7 @@ class MiniWidgetApp:
         menu.add_command(label="📊 打开桌面详细窗口 (APP)", command=self.open_or_focus_detail_window)
         menu.add_command(
             label="🌐 打开网页版高级仪表盘",
-            command=lambda: open_url_on_default_desktop(f"http://127.0.0.1:8899/?theme={self.cfg.get('theme', 'dark')}")
+            command=lambda: open_url_on_default_desktop(nm_config.dashboard_url(self.cfg.get('theme', 'dark')))
         )
         menu.add_separator()
 
@@ -1702,6 +1742,7 @@ class MiniWidgetApp:
 
     def close_widget(self):
         self.running = False
+        nm_windows.remove_pid(nm_config.WIDGET_PID)
         if self.detail_window and self.detail_window.root.winfo_exists():
             try:
                 self.detail_window.root.destroy()
@@ -1713,10 +1754,11 @@ class MiniWidgetApp:
     def exit_all(self):
         self.running = False
         try:
-            monitor_py = os.path.join(BASE_DIR, "monitor.py")
-            subprocess.run([sys.executable, monitor_py, "--stop"], capture_output=True, timeout=3)
-        except Exception:
-            pass
+            # 只停止本程序的后台服务（优雅退出 + PID 校验），不会影响其他 Python 进程
+            for msg in nm_windows.stop_monitor():
+                log_event(msg)
+        except Exception as e:
+            log_event(f"停止后台服务失败: {e}")
         self.close_widget()
 
     def fetch_stats_once(self):
@@ -1752,6 +1794,7 @@ class MiniWidgetApp:
                 self.latest_data["process_speeds"] = rt.get("process_speeds", {})
                 self.latest_data["ranking"] = data.get("ranking", [])
                 self.latest_data["route_today"] = data.get("overview", {}).get("route_today")
+                self.latest_data["collector"] = data.get("collector") or {}
                 self.latest_data["connected"] = True
                 self.consecutive_fails = 0
         except Exception:
@@ -1795,7 +1838,8 @@ class MiniWidgetApp:
             td_str = format_bytes(d["today_total"])
             dl_str = format_speed(d["down_speed"])
             ul_str = format_speed(d["up_speed"])
-            c.itemconfigure(self.item_dot, fill=th["c_down"])
+            collector_ok = (d.get("collector") or {}).get("state", "ok") == "ok"
+            c.itemconfigure(self.item_dot, fill=th["c_down"] if collector_ok else th["c_today"])
         else:
             td_str = "连接中..."
             dl_str = "0 B/s"
@@ -1820,10 +1864,10 @@ def check_or_wake_existing():
         s.connect(("127.0.0.1", IPC_PORT))
         s.sendall(b"WAKE_DETAIL\n")
         s.close()
-        log_event("成功连接到已有实例(8897)，已发送 WAKE_DETAIL 唤醒指令")
+        log_event(f"成功连接到已有实例({IPC_PORT})，已发送 WAKE_DETAIL 唤醒指令")
         return True
     except Exception:
-        log_event("未检测到 8897 端口已有实例，本进程将作为主悬浮窗启动")
+        log_event(f"未检测到 {IPC_PORT} 端口已有实例，本进程将作为主悬浮窗启动")
         return False
 
 

@@ -55,11 +55,14 @@
 - Python 版本：Python 3.8 或更高版本
 - 客户端：运行中的 Clash Verge / Clash Verge Rev（已开启 TUN 模式）
 
-### 2. 配置 Clash Verge 外部控制
-确保 Clash Verge 开启了外部控制（通常默认开启）：
-- 打开 Clash Verge **「设置 (Settings)」**
-- 确认外部控制端口为 `9097`（即 `127.0.0.1:9097`）
-- 确认密钥（Secret）为 `123456`（若为其他值，见下方自定义配置说明）
+### 2. 开启 Clash Verge 外部控制
+NetMonitor 通过 Mihomo 内核的外部控制 API 读取连接信息：
+- 打开 Clash Verge **「设置」**，打开 **「外部控制器」** 开关（新版 Clash Verge Rev 默认关闭）。
+- 建议监听地址保持 `127.0.0.1:端口`，并设置一个**足够长的随机密钥**。外部控制器可以切换节点、修改规则，不要使用 `123456` 这类弱密钥，也不要监听 `0.0.0.0`。
+- **无需在 NetMonitor 里重复填写**：程序会自动读取 Clash Verge 配置文件（`%APPDATA%\io.github.clash-verge-rev.clash-verge-rev\config.yaml` 等）中的地址与密钥；修改密钥后约 15 秒内自动生效。
+- 使用其他客户端或自动读取失败时，用环境变量 `CLASH_API_URL` / `CLASH_SECRET` 指定（见下方配置）。
+
+连接失败时，看板右上角与悬浮窗详情面板会直接显示原因：「Clash 密钥错误」「外部控制未开启」「Clash 未连接」等。
 
 ### 3. 启动与停止运行
 
@@ -96,38 +99,56 @@ python monitor.py --stop
 ```
 
 #### 停止服务
-双击运行根目录下的 [`stop_monitor.bat`](stop_monitor.bat) 即可一键安全停止所有后台运行的 NetMonitor 进程与悬浮窗。
+双击运行根目录下的 [`stop_monitor.bat`](stop_monitor.bat)（或 `python monitor.py --stop`）即可停止 NetMonitor 后台服务与悬浮窗。服务会先写完缓存数据再退出；只会结束本程序自己的进程（按 PID 文件并核对脚本完整路径），不会影响其他 Python 程序。
 
 #### 方式 E：一键创建桌面快捷方式
 - 双击运行根目录下的 [`create_desktop_shortcut.bat`](create_desktop_shortcut.bat)，即可在桌面同时生成：
   - `NetMonitor 悬浮窗.lnk`（桌面极简悬浮小组件 APP）
   - `NetMonitor.lnk`（完整 Web 分析中心）
 
-启动成功后，浏览器随时访问：👉 **http://127.0.0.1:8899**
+启动成功后，浏览器随时访问：👉 **http://127.0.0.1:8899**（端口可用 `WEB_PORT` 修改，所有启动脚本与悬浮窗会自动跟随），或运行 `python monitor.py --open`。
+
+#### 开机自启
+双击 [`enable_autostart.bat`](enable_autostart.bat)（等同 `python monitor.py --autostart`）开启，登录 Windows 时静默启动后台服务与悬浮窗；[`disable_autostart.bat`](disable_autostart.bat) 取消。
 
 ---
 
 ## ⚙️ 进阶配置与环境变量
 
-NetMonitor 支持通过系统环境变量无缝覆盖默认配置，无需修改源代码：
+NetMonitor 支持通过系统环境变量覆盖默认配置，无需修改源代码：
 
 | 环境变量 | 说明 | 默认值 |
 |---|---|---|
-| `CLASH_API_URL` | Clash Verge 内核外部控制器 API 地址 | `http://127.0.0.1:9097` |
-| `CLASH_SECRET` | Clash Verge 外部控制密钥 (Secret) | `123456` |
-| `WEB_PORT` | NetMonitor 本地 Web 监控页面端口 | `8899` |
-| `POLL_INTERVAL` | 活跃连接轮询间隔（秒） | `1.0` |
-| `DB_FILE` | 流量历史 SQLite 数据库存储文件路径 | `E:\tmp\traffic_history.db` |
-| `HIDE_CONSOLE` | 是否在 Windows 下自动隐藏控制台黑框（1: 隐藏, 0: 显示） | `1` |
+| `CLASH_API_URL` | Clash / Mihomo 外部控制器地址 | 自动读取 Clash Verge 配置，否则 `http://127.0.0.1:9097` |
+| `CLASH_SECRET` | 外部控制密钥 | 自动读取 Clash Verge 配置，否则为空 |
+| `WEB_PORT` | 本地 Web 看板端口（启动脚本与悬浮窗共用） | `8899` |
+| `NETMONITOR_IPC_PORT` | 悬浮窗单实例与唤醒使用的本地端口 | `8897` |
+| `POLL_INTERVAL` | 活跃连接轮询间隔（秒，最小 0.2） | `1.0` |
+| `NETMONITOR_DATA_DIR` | 数据目录：数据库、配置、日志、PID 文件 | `%LOCALAPPDATA%\NetMonitor` |
+| `DB_FILE` | 数据库文件路径 | 数据目录下的 `traffic_history.db`（见下方说明） |
+| `HOURLY_RETENTION_DAYS` | 小时粒度明细保留天数（看板只用天粒度汇总），`0` 为永久 | `30` |
+| `RETENTION_DAYS` | 天粒度汇总保留天数，`0` 为永久 | `0` |
+| `HIDE_CONSOLE` | Windows 下是否隐藏控制台窗口（1: 隐藏, 0: 显示） | `1` |
 
 示例（PowerShell）：
 ```powershell
 $env:CLASH_API_URL="http://127.0.0.1:9090"
-$env:CLASH_SECRET="my_custom_secret"
+$env:CLASH_SECRET="一段足够长的随机密钥"
 $env:WEB_PORT="8900"
-$env:DB_FILE="E:\tmp\traffic_history.db"
 python monitor.py
 ```
+
+### 数据位置与升级说明
+- 新安装默认把数据放在 `%LOCALAPPDATA%\NetMonitor\`（数据库 `traffic_history.db`、悬浮窗配置 `mini_config.json`、日志 `monitor.log` / `mini_widget.log`）。
+- **从旧版本升级**：如果旧默认位置 `E:\tmp\traffic_history.db` 或程序目录下已有数据库，会继续使用它，历史数据不丢；程序目录下的旧 `mini_config.json` 会自动复制到数据目录。
+- 首次启动新版本会自动升级数据库结构（生成天粒度汇总、删除从未使用的 `completed_connections` 表），一年左右的数据约需数秒。升级后可运行 `python monitor.py --cleanup 天数` 删除更早的数据并压缩数据库文件。
+- 数据库打不开时会弹窗说明原因，不再“双击没反应”；运行日志见 `monitor.log`。
+
+### 统计口径
+Mihomo 只提供“当前活跃连接”列表，轮询间隔内建立又关闭的连接无法对应到具体进程。NetMonitor 用内核的全局流量计数校准总量，这部分流量计入 **「未归属（短连接）」**，因此每日总流量是准确的，按进程的排行是采样统计。缩短 `POLL_INTERVAL` 可以减少未归属部分，但会增加 CPU 占用。
+
+### 隐私与安全
+记录的数据相当于上网轨迹（访问过的域名、程序路径、代理节点），只保存在本机。Web 服务只监听 `127.0.0.1`，并且不允许其他网站跨站读取接口、拒绝非本机 Host 头（防 DNS 重绑定）、有副作用的操作只接受本页面发出的请求；看板中所有来自数据的文字（含订阅里的节点名）都会转义后显示。
 
 ---
 
@@ -152,14 +173,26 @@ python monitor.py
 
 ```text
 NetMonitor/
-├── .gitignore               # Git 忽略配置（自动排除大体积 SQLite 数据库及缓存）
-├── LICENSE                  # 开源协议 (MIT License)
-├── README.md                # 项目使用说明文档
-├── monitor.py               # 核心后端监控服务、API 轮询与内嵌 Web 仪表盘
-├── start_monitor.bat        # Windows 启动脚本（自动隐藏命令行黑框）
-├── start_monitor_silent.vbs # Windows 纯静默无黑框启动器
-└── stop_monitor.bat         # Windows 一键停止后台监控脚本
+├── monitor.py               # 命令行入口：启动/停止服务、打开看板、开机自启、数据清理
+├── mini_widget.py           # 桌面悬浮窗与原生详情面板（Tk）
+├── nm_config.py             # 共享配置：端口、数据目录、Clash 外部控制器自动识别
+├── collector.py             # 流量采集：轮询 /connections、总量校准、写库重试
+├── storage.py               # SQLite：建表与迁移、写入、数据保留、看板查询
+├── web.py                   # 本地 Web 服务与 JSON 接口（含安全校验）
+├── nm_windows.py            # 进程管理、开机自启、桌面快捷方式、错误弹窗
+├── static/                  # Web 看板页面与图标
+├── tests/                   # 单元测试（标准库 unittest + 假 Mihomo 接口）
+├── create_shortcuts.py      # 创建桌面快捷方式
+├── *.bat / *.vbs            # Windows 启动、停止、自启脚本
+└── .github/workflows/       # CI：Windows / Linux × Python 3.8 / 3.12
 ```
+
+## 🧪 开发与测试
+
+```powershell
+python -m unittest discover -s tests -t .
+```
+测试只依赖标准库，使用临时数据目录和一个可编程的假 Mihomo 接口，不会读写你的真实数据。
 
 ---
 

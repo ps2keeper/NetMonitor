@@ -1,0 +1,5 @@
+# Windows 脚本必须以 CRLF 换行检出，cmd.exe 解析 LF 换行的批处理时可能出错
+*.bat text eol=crlf
+*.vbs text eol=crlf
+*.py text eol=lf
+*.html text eol=lf

@@ -19,8 +19,5 @@ ws.Run pythonwExe & " """ & currentDir & "\monitor.py""", 0, False
 ' 2. Start mini desktop floating widget
 ws.Run pythonwExe & " """ & currentDir & "\mini_widget.py""", 0, False
 
-' 3. Wait briefly for server to bind port
-WScript.Sleep 500
-
-' 4. Open dashboard in default browser
-ws.Run "http://127.0.0.1:8899", 1
+' 3. Open the dashboard once the server is ready (port comes from WEB_PORT / nm_config)
+ws.Run pythonwExe & " """ & currentDir & "\monitor.py"" --open", 0, False
