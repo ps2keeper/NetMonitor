@@ -207,7 +207,8 @@ class WebHandler(http.server.BaseHTTPRequestHandler):
             },
             "today": {"date": today, "download": t_dl, "upload": t_ul, "total": t_dl + t_ul},
             "yesterday": {"date": yesterday, "download": y_dl, "upload": y_ul, "total": y_dl + y_ul},
-            "last_month": {"month": last_month, "label": last_month_day.strftime("%Y年%m月"),
+            # 不用 strftime 拼中文：Windows 上 Python 3.8/3.9 的 strftime 无法编码非 ASCII 格式串
+            "last_month": {"month": last_month, "label": f"{last_month_day.year}年{last_month_day.month:02d}月",
                            "download": lm_dl, "upload": lm_ul, "total": lm_dl + lm_ul, "days_count": lm_days},
             "all_time": {"download": a_dl, "upload": a_ul, "total": a_dl + a_ul, "days_count": days},
         }
